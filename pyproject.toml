@@ -1,0 +1,34 @@
+[project]
+name = "intra-gpu-reduction"
+version = "0.1.0"
+description = "MXFP4 emulated on Hopper FP8 tensor cores, and the packed dual-accumulator reduction experiment"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Linux PyPI wheels are CUDA-enabled, which is what you want on an H100.
+    # To pin a specific CUDA build instead:
+    #   uv sync --index https://download.pytorch.org/whl/cu128
+    "torch>=2.6",
+    # Triton publishes Linux wheels only. The marker keeps `uv sync` working on
+    # a Windows or macOS dev box, where you can still lint and read the code but
+    # not run the kernels.
+    "triton>=3.0 ; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[tool.uv]
+# A collection of scripts, not an installable library.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "E731",  # lambdas for Triton grid callables are the idiom
+]

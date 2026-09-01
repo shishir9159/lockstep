@@ -1,0 +1,19 @@
+# Allowlist: ignore everything, then re-include source files by type.
+*
+!*/
+!.gitignore
+!.python-version
+!*.py
+!*.c
+!*.cu
+!*.cuh
+!*.toml
+!*.lock
+!Makefile
+!justfile
+
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.claude/
