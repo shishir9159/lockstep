@@ -14,6 +14,7 @@
 //      the packing could ever buy.
 //
 // Experiment 1 checks the FP4 -> FP8 expansion (prmt exists on sm_75).
+// Experiment 4 runs a minimal fwd/wgrad on CUDA-core GEMMs.
 //
 //   nvcc -O3 -arch=sm_75 -o rig rig.cu
 //   ./rig            # all four
@@ -191,6 +192,249 @@ static void exp_reduce() {
     cudaFree(o1); cudaFree(o2);
 }
 
+// ================================================== 4. minimal fwd + wgrad on CUDA cores
+#define TS 16
+
+__global__ void gemm_tiled(const float *__restrict__ A, const float *__restrict__ B,
+                           float *__restrict__ C, int M, int N, int K) {
+    __shared__ float sA[TS][TS], sB[TS][TS];
+    int row = blockIdx.y * TS + threadIdx.y;
+    int col = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.f;
+    for (int t = 0; t < K; t += TS) {
+        sA[threadIdx.y][threadIdx.x] =
+            (row < M && t + (int)threadIdx.x < K) ? A[(size_t)row * K + t + threadIdx.x] : 0.f;
+        sB[threadIdx.y][threadIdx.x] =
+            (t + (int)threadIdx.y < K && col < N) ? B[(size_t)(t + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TS; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[(size_t)row * N + col] = acc;
+}
+
+// C[M,N] = A^T @ B, with A stored [K,M]. This is the wgrad shape: dW = dY^T @ X
+// with dY stored [batch, Cout]. Both wgrad variants use it, so the strided read
+// of A is paid equally and only the op count differs.
+__global__ void gemm_tiled_at(const float *__restrict__ A, const float *__restrict__ B,
+                              float *__restrict__ C, int M, int N, int K) {
+    __shared__ float sA[TS][TS], sB[TS][TS];
+    int row = blockIdx.y * TS + threadIdx.y;
+    int col = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.f;
+    for (int t = 0; t < K; t += TS) {
+        sA[threadIdx.y][threadIdx.x] =
+            (row < M && t + (int)threadIdx.x < K) ? A[(size_t)(t + threadIdx.x) * M + row] : 0.f;
+        sB[threadIdx.y][threadIdx.x] =
+            (t + (int)threadIdx.y < K && col < N) ? B[(size_t)(t + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TS; ++k) acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[(size_t)row * N + col] = acc;
+}
+
+__global__ void add_into(float *dst, const float *a, const float *b, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = a[i] + b[i];
+}
+
+// THE CONTROL. Two accumulators, but B is loaded once and reused by both
+// microbatches -- exactly like the packed kernel, minus the bit trick. If this
+// matches `packed`, then the speedup is operand reuse and the packing adds
+// nothing.
+__global__ void gemm_fused2(const float *__restrict__ A1, const float *__restrict__ A2,
+                            const float *__restrict__ B, float *__restrict__ C1,
+                            float *__restrict__ C2, int M, int N, int K) {
+    __shared__ float sA1[TS][TS], sA2[TS][TS], sB[TS][TS];
+    int row = blockIdx.y * TS + threadIdx.y;
+    int col = blockIdx.x * TS + threadIdx.x;
+    float acc1 = 0.f, acc2 = 0.f;
+    for (int t = 0; t < K; t += TS) {
+        bool ra = row < M && t + (int)threadIdx.x < K;
+        sA1[threadIdx.y][threadIdx.x] = ra ? A1[(size_t)row * K + t + threadIdx.x] : 0.f;
+        sA2[threadIdx.y][threadIdx.x] = ra ? A2[(size_t)row * K + t + threadIdx.x] : 0.f;
+        sB[threadIdx.y][threadIdx.x] =
+            (t + (int)threadIdx.y < K && col < N) ? B[(size_t)(t + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TS; ++k) {
+            float b = sB[k][threadIdx.x];
+            acc1 += sA1[threadIdx.y][k] * b;
+            acc2 += sA2[threadIdx.y][k] * b;
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) {
+        C1[(size_t)row * N + col] = acc1;
+        C2[(size_t)row * N + col] = acc2;
+    }
+}
+
+// Packed: one accumulator carries both microbatches. B is shared between them,
+// which is exactly the forward/dgrad case.
+__global__ void gemm_packed(const float *__restrict__ A1, const float *__restrict__ A2,
+                            const float *__restrict__ B, float *__restrict__ C,
+                            int M, int N, int K, float s, int drop) {
+    __shared__ float sA1[TS][TS], sA2[TS][TS], sB[TS][TS];
+    int row = blockIdx.y * TS + threadIdx.y;
+    int col = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.f;
+    for (int t = 0; t < K; t += TS) {
+        bool ra = row < M && t + (int)threadIdx.x < K;
+        sA1[threadIdx.y][threadIdx.x] = ra ? A1[(size_t)row * K + t + threadIdx.x] : 0.f;
+        sA2[threadIdx.y][threadIdx.x] = ra ? A2[(size_t)row * K + t + threadIdx.x] : 0.f;
+        sB[threadIdx.y][threadIdx.x] =
+            (t + (int)threadIdx.y < K && col < N) ? B[(size_t)(t + threadIdx.y) * N + col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < TS; ++k) {
+            float b = sB[k][threadIdx.x];
+            acc = round_sig(acc + sA1[threadIdx.y][k] * b, drop);
+            acc = round_sig(acc + s * (sA2[threadIdx.y][k] * b), drop);
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[(size_t)row * N + col] = acc;
+}
+
+static void exp_gemm() {
+    const int B = 512, CIN = 1024, COUT = 1024;
+    printf("\n[4] minimal fwd + wgrad, CUDA-core GEMMs (B=%d Cin=%d Cout=%d)\n",
+           B, CIN, COUT);
+
+    std::uniform_int_distribution<int> cd(0, 14);
+    const int codes[15] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
+    auto fill = [&](std::vector<float> &v) {
+        for (auto &x : v) x = (float)e2m1_q(codes[cd(rng)]);
+    };
+    std::vector<float> hX((size_t)2 * B * CIN), hW((size_t)CIN * COUT), hdY((size_t)2 * B * COUT);
+    fill(hX); fill(hW); fill(hdY);
+
+    float *X, *W, *dY, *C1, *C2, *Ccat, *dW;
+    CHECK(cudaMalloc(&X, hX.size() * 4));
+    CHECK(cudaMalloc(&W, hW.size() * 4));
+    CHECK(cudaMalloc(&dY, hdY.size() * 4));
+    CHECK(cudaMalloc(&C1, (size_t)B * COUT * 4));
+    CHECK(cudaMalloc(&C2, (size_t)B * COUT * 4));
+    CHECK(cudaMalloc(&Ccat, (size_t)2 * B * COUT * 4));
+    CHECK(cudaMalloc(&dW, (size_t)COUT * CIN * 4));
+    CHECK(cudaMemcpy(X, hX.data(), hX.size() * 4, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(W, hW.data(), hW.size() * 4, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dY, hdY.data(), hdY.size() * 4, cudaMemcpyHostToDevice));
+    float *X2 = X + (size_t)B * CIN;
+
+    const int s = slot_offset(CIN);
+    const float sf = ldexpf(1.f, s);
+    dim3 blk(TS, TS);
+    Timer tm;
+    const int iters = 20;
+
+    // Best-of-5. A desktop card boosts and throttles, and the mean of a single
+    // burst moves by 40% between runs; the minimum is far steadier.
+    auto time_it = [&](const char *name, auto fn, double flops) {
+        fn(); CHECK(cudaDeviceSynchronize());
+        float best = 1e30f;
+        for (int rep = 0; rep < 5; ++rep) {
+            tm.start();
+            for (int i = 0; i < iters; ++i) fn();
+            float ms = tm.stop() / iters;
+            if (ms < best) best = ms;
+        }
+        printf("    %-30s %8.3f ms  %6.1f GFLOP/s\n", name, best,
+               flops / (best * 1e-3) / 1e9);
+        return best;
+    };
+
+    dim3 g1((COUT + TS - 1) / TS, (B + TS - 1) / TS);
+    dim3 gc((COUT + TS - 1) / TS, (2 * B + TS - 1) / TS);
+    double fl = 2.0 * (2 * B) * CIN * COUT;
+
+    printf("  forward (both microbatches share W):\n");
+    float tv = time_it("vanilla: 2 GEMM launches", [&] {
+        gemm_tiled<<<g1, blk>>>(X, W, C1, B, COUT, CIN);
+        gemm_tiled<<<g1, blk>>>(X2, W, C2, B, COUT, CIN);
+    }, fl);
+    float tc = time_it("concat: 1 GEMM, taller M", [&] {
+        gemm_tiled<<<gc, blk>>>(X, W, Ccat, 2 * B, COUT, CIN);
+    }, fl);
+    float tf = time_it("fused: 2 acc, B loaded once", [&] {
+        gemm_fused2<<<g1, blk>>>(X, X2, W, C1, C2, B, COUT, CIN);
+    }, fl);
+    float tp = time_it("packed: 1 acc, B loaded once", [&] {
+        gemm_packed<<<g1, blk>>>(X, X2, W, C1, B, COUT, CIN, sf, 0);
+    }, fl);
+    printf("    vs vanilla: concat %.2fx, fused %.2fx, packed %.2fx\n",
+           tv / tc, tv / tf, tv / tp);
+    printf("    ATTRIBUTION: fused gets %.2fx from loading B once (no bit trick,\n",
+           tv / tf);
+    printf("    both results kept exactly). Packing adds %.2fx on top of that,\n", tf / tp);
+    printf("    from one accumulator register and one store instead of two.\n");
+
+    // Is the packed forward result actually recoverable? Spot-check exactly.
+    std::vector<float> hc(( size_t)B * COUT);
+    CHECK(cudaMemcpy(hc.data(), C1, hc.size() * 4, cudaMemcpyDeviceToHost));
+    int ok = 0, tried = 0;
+    for (int m = 0; m < B; m += 37)
+        for (int n = 0; n < COUT; n += 41) {
+            long long r1 = 0, r2 = 0;
+            for (int k = 0; k < CIN; ++k) {
+                r1 += (long long)hX[(size_t)m * CIN + k] * hW[(size_t)k * COUT + n];
+                r2 += (long long)hX[(size_t)(B + m) * CIN + k] * hW[(size_t)k * COUT + n];
+            }
+            double v = hc[(size_t)m * COUT + n];
+            double g2 = nearbyint(v / (double)sf), g1v = v - g2 * (double)sf;
+            ++tried;
+            if (g1v == (double)r1 && g2 == (double)r2) ++ok;
+        }
+    printf("    packed forward exactly recoverable: %d/%d  (needs %d bits, fp32 has 24)\n",
+           ok, tried, packed_bits_needed(CIN));
+
+    printf("  wgrad = dY^T @ X (the two microbatches are SUMMED -- the reduction):\n");
+    dim3 gw((CIN + TS - 1) / TS, (COUT + TS - 1) / TS);
+    float *T1, *T2;
+    CHECK(cudaMalloc(&T1, (size_t)COUT * CIN * 4));
+    CHECK(cudaMalloc(&T2, (size_t)COUT * CIN * 4));
+    float *dY2 = dY + (size_t)B * COUT;
+    size_t wn = (size_t)COUT * CIN;
+
+    float wv = time_it("vanilla: 2 GEMM + add", [&] {
+        gemm_tiled_at<<<gw, blk>>>(dY, X, T1, COUT, CIN, B);
+        gemm_tiled_at<<<gw, blk>>>(dY2, X2, T2, COUT, CIN, B);
+        add_into<<<(unsigned)((wn + 255) / 256), 256>>>(dW, T1, T2, wn);
+    }, 2.0 * COUT * CIN * (2 * B));
+    float wc = time_it("concat-K: 1 GEMM, 1 accumulator", [&] {
+        gemm_tiled_at<<<gw, blk>>>(dY, X, dW, COUT, CIN, 2 * B);
+    }, 2.0 * COUT * CIN * (2 * B));
+    printf("    concat-K %.2fx vs vanilla\n", wv / wc);
+    printf("    Folding the add into the accumulator saves ~12 MB of traffic, which\n");
+    printf("    is nothing next to a CUDA-core GEMM. On a tensor-core H100 the same\n");
+    printf("    GEMM is ~200x faster while the add is not, so the ratio there is not\n");
+    printf("    this ratio -- see the caveat at the end.\n");
+
+    // Both wgrad paths must agree exactly: same integers, same order per output.
+    {
+        gemm_tiled_at<<<gw, blk>>>(dY, X, T1, COUT, CIN, B);
+        gemm_tiled_at<<<gw, blk>>>(dY2, X2, T2, COUT, CIN, B);
+        add_into<<<(unsigned)((wn + 255) / 256), 256>>>(T1, T1, T2, wn);
+        gemm_tiled_at<<<gw, blk>>>(dY, X, dW, COUT, CIN, 2 * B);
+        CHECK(cudaDeviceSynchronize());
+        std::vector<float> hv(wn), hc2(wn);
+        CHECK(cudaMemcpy(hv.data(), T1, wn * 4, cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(hc2.data(), dW, wn * 4, cudaMemcpyDeviceToHost));
+        size_t diff = 0;
+        for (size_t i = 0; i < wn; ++i) if (hv[i] != hc2[i]) ++diff;
+        printf("    vanilla vs concat-K: %zu of %zu elements differ -> %s\n",
+               diff, wn, diff ? "MISMATCH" : "identical");
+    }
+
+    cudaFree(X); cudaFree(W); cudaFree(dY);
+    cudaFree(C1); cudaFree(C2); cudaFree(Ccat); cudaFree(dW);
+    cudaFree(T1); cudaFree(T2);
+}
+
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -203,6 +447,7 @@ int main(int argc, char **argv) {
     if (want("unpack")) exp_unpack();
     if (want("bits")) exp_bits();
     if (want("reduce")) exp_reduce();
+    if (want("gemm")) exp_gemm();
 
     printf("\nWHAT TRANSFERS TO AN H100, AND WHAT DOES NOT\n");
     printf("  transfers: [1] and [2]. Bit widths are bit widths. The exact-recovery\n");
@@ -210,6 +455,10 @@ int main(int argc, char **argv) {
     printf("    they match an independent CPU bignum simulation of the same thing.\n");
     printf("  transfers: [3]. Atomic reduction traffic is bandwidth-bound on every\n");
     printf("    GPU, so the ratio is the honest upper bound on the packing idea.\n");
+    printf("  does NOT transfer: [4] absolute rates and the wgrad ratio. A CUDA-core\n");
+    printf("    GEMM here is ~200x slower than an H100 tensor-core GEMM, so epilogue\n");
+    printf("    and add costs look free here and do not there. Use [4] for the\n");
+    printf("    ATTRIBUTION line (fusion vs packing), not for absolute speedups.\n");
     printf("\n");
     return 0;
 }

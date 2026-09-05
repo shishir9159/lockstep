@@ -47,6 +47,12 @@ bits: build
 reduce: build
     ./rig_sm75/rig reduce
 
+# GOAL: attribution. An earlier version reported 1.85x for packing; adding the
+# fused control showed the win was entirely operand reuse. Never drop a control.
+# [4] minimal fwd + wgrad: 2 launches / concat / fused-2-acc / packed-1-acc
+gemm: build
+    ./rig_sm75/rig gemm
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
