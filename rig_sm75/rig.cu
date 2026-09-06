@@ -435,6 +435,259 @@ static void exp_gemm() {
     cudaFree(T1); cudaFree(T2);
 }
 
+// ============================== 5. split-K with packed int16 partials =========
+//
+// The repaired version of the packing idea. Two changes from experiment [3]:
+//
+//   * packing is a TRANSPORT format, not an accumulation format. Two int16
+//     partials share one int32 word. Nothing is ever multiplied while packed and
+//     nothing accumulates while packed, so there are no cross terms and no
+//     accumulator-width problem -- the reduce kernel unpacks first, then sums in
+//     full int32 width.
+//   * partials go to memory and a second kernel reduces them, instead of
+//     atomics. That is what makes unpack-before-sum possible, and it is usually
+//     faster than atomics anyway.
+//
+// Exactness condition: a split of depth d has |partial| <= 144*d, so int16 holds
+// it exactly while d <= 227. Split deep enough and the packing is lossless.
+//
+// The GEMM is the fused shared-operand form: Bt is loaded once and feeds both
+// microbatches, which is the 1.4-1.5x from experiment [4].
+#define SK_TS 16
+#define SK_TK 16
+#define SK_PAD 4
+
+template <int MODE>   // 0 = atomics, 1 = two int32 partials, 2 = packed int16 pair
+__global__ __launch_bounds__(SK_TS * SK_TS) void splitk_fused(
+        const signed char *__restrict__ A1, const signed char *__restrict__ A2,
+        const signed char *__restrict__ Bt, int *__restrict__ out,
+        int M, int N, int K, int S) {
+    __shared__ __align__(16) signed char sA1[SK_TS][SK_TK + SK_PAD];
+    __shared__ __align__(16) signed char sA2[SK_TS][SK_TK + SK_PAD];
+    __shared__ __align__(16) signed char sB[SK_TS][SK_TK + SK_PAD];
+
+    const int split = blockIdx.z;
+    const int d = K / S;
+    const int k0 = split * d;
+    const int row = blockIdx.y * SK_TS + threadIdx.y;
+    const int col = blockIdx.x * SK_TS + threadIdx.x;
+    const int lk = threadIdx.x, lr = threadIdx.y;
+
+    int acc1 = 0, acc2 = 0;
+    for (int t = 0; t < d; t += SK_TK) {
+        sA1[lr][lk] = A1[(size_t)(blockIdx.y * SK_TS + lr) * K + k0 + t + lk];
+        sA2[lr][lk] = A2[(size_t)(blockIdx.y * SK_TS + lr) * K + k0 + t + lk];
+        sB[lr][lk] = Bt[(size_t)(blockIdx.x * SK_TS + lr) * K + k0 + t + lk];
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < SK_TK; kk += 4) {
+            int a1 = *(const int *)&sA1[threadIdx.y][kk];
+            int a2 = *(const int *)&sA2[threadIdx.y][kk];
+            int b = *(const int *)&sB[threadIdx.x][kk];
+            acc1 = __dp4a(a1, b, acc1);       // 4 int8 MACs in one instruction
+            acc2 = __dp4a(a2, b, acc2);       // Bt reused: the fused-operand win
+        }
+        __syncthreads();
+    }
+
+    const size_t MN = (size_t)M * N;
+    const size_t i = (size_t)row * N + col;
+    if (MODE == 0) {
+        atomicAdd(&out[i], acc1);
+        atomicAdd(&out[MN + i], acc2);
+    } else if (MODE == 1) {
+        out[((size_t)split * 2) * MN + i] = acc1;          // 8 bytes per output
+        out[((size_t)split * 2 + 1) * MN + i] = acc2;
+    } else {
+        unsigned p = ((unsigned)(acc2 & 0xFFFF) << 16) | (unsigned)(acc1 & 0xFFFF);
+        out[(size_t)split * MN + i] = (int)p;              // 4 bytes per output
+    }
+}
+
+__global__ void reduce_store2(const int *__restrict__ part, int *c1, int *c2,
+                              size_t MN, int S) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= MN) return;
+    int a = 0, b = 0;
+    for (int s = 0; s < S; ++s) {
+        a += part[((size_t)s * 2) * MN + i];
+        b += part[((size_t)s * 2 + 1) * MN + i];
+    }
+    c1[i] = a; c2[i] = b;
+}
+
+__global__ void reduce_packed(const int *__restrict__ part, int *c1, int *c2,
+                              size_t MN, int S) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= MN) return;
+    int a = 0, b = 0;
+    for (int s = 0; s < S; ++s) {
+        unsigned p = (unsigned)part[(size_t)s * MN + i];
+        a += (int)(short)(p & 0xFFFF);        // unpack, THEN sum in full width
+        b += (int)(short)(p >> 16);
+    }
+    c1[i] = a; c2[i] = b;
+}
+
+static void exp_splitk() {
+    const int M = 256, N = 256, K = 8192;
+    const size_t MN = (size_t)M * N;
+    printf("\n[5] split-K, fused shared operand, packed int16 partials\n");
+    printf("    M=%d N=%d K=%d, skinny enough that split-K earns its place\n", M, N, K);
+    printf("    int8 operands on the FP4 grid, int32 accumulate, dp4a inner loop\n");
+
+    std::uniform_int_distribution<int> cd(0, 14);
+    const int codes[15] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
+    std::vector<signed char> hA1((size_t)M * K), hA2((size_t)M * K), hBt((size_t)N * K);
+    for (auto &v : hA1) v = (signed char)e2m1_q(codes[cd(rng)]);
+    for (auto &v : hA2) v = (signed char)e2m1_q(codes[cd(rng)]);
+    for (auto &v : hBt) v = (signed char)e2m1_q(codes[cd(rng)]);
+
+    signed char *A1, *A2, *Bt;
+    CHECK(cudaMalloc(&A1, hA1.size())); CHECK(cudaMalloc(&A2, hA2.size()));
+    CHECK(cudaMalloc(&Bt, hBt.size()));
+    CHECK(cudaMemcpy(A1, hA1.data(), hA1.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(A2, hA2.data(), hA2.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(Bt, hBt.data(), hBt.size(), cudaMemcpyHostToDevice));
+
+    // exact reference on a sample of outputs
+    std::vector<std::pair<int, int>> sample;
+    for (int m = 0; m < M; m += 29)
+        for (int n = 0; n < N; n += 31) sample.push_back({m, n});
+    std::vector<long long> r1(sample.size()), r2(sample.size());
+    for (size_t q = 0; q < sample.size(); ++q) {
+        long long a = 0, b = 0;
+        int m = sample[q].first, n = sample[q].second;
+        for (int k = 0; k < K; ++k) {
+            a += (long long)hA1[(size_t)m * K + k] * hBt[(size_t)n * K + k];
+            b += (long long)hA2[(size_t)m * K + k] * hBt[(size_t)n * K + k];
+        }
+        r1[q] = a; r2[q] = b;
+    }
+
+    int *c1, *c2, *atom, *part;
+    CHECK(cudaMalloc(&c1, MN * 4)); CHECK(cudaMalloc(&c2, MN * 4));
+    CHECK(cudaMalloc(&atom, MN * 8));
+    CHECK(cudaMalloc(&part, MN * 4 * 512));      // room for S=256 unpacked
+
+    dim3 blk(SK_TS, SK_TS);
+    Timer tm;
+    const int iters = 20;
+    auto best_of = [&](auto fn) {
+        fn(); CHECK(cudaDeviceSynchronize());
+        float best = 1e30f;
+        for (int r = 0; r < 5; ++r) {
+            tm.start();
+            for (int i = 0; i < iters; ++i) fn();
+            float ms = tm.stop() / iters;
+            if (ms < best) best = ms;
+        }
+        return best;
+    };
+    auto verify = [&](const char *tag) {
+        std::vector<int> h1(MN), h2(MN);
+        CHECK(cudaMemcpy(h1.data(), c1, MN * 4, cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(h2.data(), c2, MN * 4, cudaMemcpyDeviceToHost));
+        size_t bad = 0;
+        for (size_t q = 0; q < sample.size(); ++q) {
+            size_t i = (size_t)sample[q].first * N + sample[q].second;
+            if ((long long)h1[i] != r1[q] || (long long)h2[i] != r2[q]) ++bad;
+        }
+        printf("%s%s", bad ? "  WRONG(" : "  exact", bad ? "" : "");
+        if (bad) printf("%zu/%zu)", bad, sample.size());
+        return bad;
+    };
+
+    printf("\n    %4s %5s %7s %10s %10s %10s %9s\n",
+           "S", "depth", "int16?", "gemm ms", "reduce ms", "total ms", "verdict");
+
+    double gemm_flops = 2.0 * 2 * M * N * K;
+    float packed_total_ref = 0.f, store2_total_ref = 0.f;
+    double packed_bytes_ref = 0, store2_bytes_ref = 0;
+
+    for (int S : {32, 64, 128, 256}) {
+        const int d = K / S;
+        if (d % SK_TK) continue;
+        dim3 grd(N / SK_TS, M / SK_TS, S);
+        const bool safe = (long long)FP4_PMAX * d <= 32767;
+
+        // --- path 1: two int32 partials + reduce -----------------------------
+        float g1 = best_of([&] { splitk_fused<1><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S); });
+        float rd1 = best_of([&] {
+            reduce_store2<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        });
+        splitk_fused<1><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S);
+        reduce_store2<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        CHECK(cudaDeviceSynchronize());
+        printf("    %4d %5d %7s %10.3f %10.3f %10.3f", S, d, safe ? "safe" : "OVERFL",
+               g1, rd1, g1 + rd1);
+        printf("  int32x2"); verify(""); printf("\n");
+
+        // --- path 2: packed int16 pair + reduce ------------------------------
+        float g2 = best_of([&] { splitk_fused<2><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S); });
+        float rd2 = best_of([&] {
+            reduce_packed<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        });
+        splitk_fused<2><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S);
+        reduce_packed<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        CHECK(cudaDeviceSynchronize());
+        printf("    %4s %5s %7s %10.3f %10.3f %10.3f", "", "", "", g2, rd2, g2 + rd2);
+        printf("  packed "); verify(""); printf("  %.2fx\n", (g1 + rd1) / (g2 + rd2));
+
+        // --- path 3: atomics, for reference -----------------------------------
+        float g3 = best_of([&] {
+            CHECK(cudaMemsetAsync(atom, 0, MN * 8));
+            splitk_fused<0><<<grd, blk>>>(A1, A2, Bt, atom, M, N, K, S);
+        });
+        printf("    %4s %5s %7s %10.3f %10s %10.3f  atomics\n", "", "", "", g3, "-", g3);
+
+        if (S == 64) {
+            packed_total_ref = g2 + rd2;
+            store2_total_ref = g1 + rd1;
+            packed_bytes_ref = (double)S * MN * 4 * 2 + MN * 8;   // write + read + out
+            store2_bytes_ref = (double)S * MN * 8 * 2 + MN * 8;
+        }
+        printf("\n");
+    }
+
+    // ---- what this looks like on an H100 --------------------------------------
+    printf("    NOTES\n");
+    printf("      The OVERFL row is a WORST-CASE bound (144*depth > 32767), not a\n");
+    printf("      measurement. Random FP4 data does not reach the bound, so it still\n");
+    printf("      verifies exact -- do not ship it on that evidence. depth <= 227 is\n");
+    printf("      the condition that is safe for any input.\n");
+    printf("      Atomics look good here because the output is only %.0f KB and fits\n",
+           MN * 8 / 1024.0);
+    printf("      in this card's 1 MB L2, so they never reach DRAM. The two-phase\n");
+    printf("      paths write %.0f MB of partials and do. Packing helps exactly when\n",
+           (double)64 * MN * 8 / 1e6);
+    printf("      the partials are too big for L2 -- raise M,N or S and atomics lose.\n");
+
+    if (store2_total_ref > 0.f) {
+        printf("\n    ROOFLINE (arithmetic, not measured) at S=64:\n");
+        printf("      partial traffic  %6.1f MB unpacked -> %6.1f MB packed\n",
+               store2_bytes_ref / 1e6, packed_bytes_ref / 1e6);
+        const double h100_ops = 1400e12, h100_bw = 3350e9;     // achieved, not peak
+        double gemm_h = gemm_flops / h100_ops * 1e3;
+        double red_hu = store2_bytes_ref / h100_bw * 1e3;
+        double red_hp = packed_bytes_ref / h100_bw * 1e3;
+        printf("      this card : %.3f -> %.3f ms measured, %.2fx; traffic is %.0f%%\n",
+               store2_total_ref, packed_total_ref, store2_total_ref / packed_total_ref,
+               100.0 * (store2_bytes_ref / 192e9 * 1e3) / store2_total_ref);
+        printf("      H100 est. : gemm %.4f ms, traffic %.4f ms -> reduce is %.0f%%\n",
+               gemm_h, red_hu, 100.0 * red_hu / (gemm_h + red_hu));
+        printf("      packing on H100: %.4f -> %.4f ms, %.2fx end to end\n",
+               gemm_h + red_hu, gemm_h + red_hp, (gemm_h + red_hu) / (gemm_h + red_hp));
+        printf("      This is the one place your slower-card reasoning is exactly\n");
+        printf("      right: an H100 does ~%.0fx more arithmetic per byte moved, so a\n",
+               (h100_ops / h100_bw) / (900e9 / 192e9));
+        printf("      byte you avoid moving is worth that much more there.\n");
+    }
+
+    cudaFree(A1); cudaFree(A2); cudaFree(Bt);
+    cudaFree(c1); cudaFree(c2); cudaFree(atom); cudaFree(part);
+}
+
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -448,6 +701,7 @@ int main(int argc, char **argv) {
     if (want("bits")) exp_bits();
     if (want("reduce")) exp_reduce();
     if (want("gemm")) exp_gemm();
+    if (want("splitk")) exp_splitk();
 
     printf("\nWHAT TRANSFERS TO AN H100, AND WHAT DOES NOT\n");
     printf("  transfers: [1] and [2]. Bit widths are bit widths. The exact-recovery\n");

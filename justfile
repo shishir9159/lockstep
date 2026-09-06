@@ -53,6 +53,12 @@ reduce: build
 gemm: build
     ./rig_sm75/rig gemm
 
+# GOAL: the repaired idea -- packing as TRANSPORT, never as accumulation, with
+# partials going to memory for a second kernel instead of to atomics.
+# [5] split-K storing packed int16 partials
+splitk: build
+    ./rig_sm75/rig splitk
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
