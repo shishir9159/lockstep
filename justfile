@@ -2,6 +2,7 @@
 #
 #   just              list recipes
 #   just rig          experiments [1]-[5]: does the packing idea work at all?
+#   just rig-q        experiments [6]-[19]: quantization formats and transport
 #   just h100         the Hopper experiments (needs an H100)
 #
 # Every recipe says what QUESTION its experiment answers. Most of them exist to
@@ -20,9 +21,10 @@ _default:
 # Builds for sm_75 by default. Override: just arch=sm_90a rig
 arch := "sm_75"
 
-# Build both portable binaries (rig)
+# Build both portable binaries (rig, rig_q)
 build:
     nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig rig_sm75/rig.cu
+    nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig_q rig_sm75/rig_q.cu
 
 # ------------------------------------------------- [1]-[5]  does the idea work?
 
@@ -58,6 +60,28 @@ gemm: build
 # [5] split-K storing packed int16 partials
 splitk: build
     ./rig_sm75/rig splitk
+
+# --------------------------------------------- [6]-[14]  formats and transport
+
+# [6]-[19]: formats, controls, the interconnect, scale, feedback, MoE, the full chain
+rig-q: build
+    ./rig_sm75/rig_q
+
+# GOAL: the control [5] was missing. Both int16 rows move IDENTICAL bytes, so a
+# gap between them is the pairing alone and a gap to int32x2 is the narrowing.
+# Decides whether the write-up says "packing" or "narrowing".
+# [6] int32x2 vs int16x2 vs packed-int16 -- packing or narrowing?
+narrow: build
+    ./rig_sm75/rig_q narrow
+
+# GOAL: separate the ACCUMULATOR question from the OPERAND question, so we learn
+# which one actually kills packed accumulation. INT8 is the only Hopper datapath
+# with a true 32-bit integer accumulator (fp32 has 24 significand bits, FP8 ~14).
+# Prints a worst-case column beside the observed one so random-data success
+# cannot be mistaken for a guarantee.
+# [7] INT8/s32 -- is the accumulator the problem, or the operand?
+int8acc: build
+    ./rig_sm75/rig_q int8acc
 
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
