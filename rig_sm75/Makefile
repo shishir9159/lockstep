@@ -8,7 +8,7 @@ all: rig rig_q
 rig: rig.cu fp4_sim.cuh
 	$(NVCC) $(FLAGS) -o $@ $<
 
-rig_q: rig_q.cu fp4_sim.cuh
+rig_q: rig_q.cu fp4_sim.cuh quant_sim.cuh
 	$(NVCC) $(FLAGS) -o $@ $<
 
 run: rig rig_q

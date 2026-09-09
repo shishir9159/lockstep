@@ -83,6 +83,25 @@ narrow: build
 int8acc: build
     ./rig_sm75/rig_q int8acc
 
+# GOAL: accuracy per bit on clean and outlier-heavy data, and which of the two
+# axes -- block size or scale format -- is actually doing the work.
+# [8] MXFP4 (block 32, E8M0) vs NVFP4 (block 16, E4M3)
+nvfp4: build
+    ./rig_sm75/rig_q nvfp4
+
+# GOAL: on Hopper all of these run at the SAME FLOP rate, because MXFP4 is
+# emulated onto the FP8 datapath. So price the 4-bit formats honestly: what does
+# the halved byte count actually cost in accuracy?
+# [9] MXFP4 vs NVFP4 vs MXFP8 vs BF16 against an fp64 reference
+mxfp8: build
+    ./rig_sm75/rig_q mxfp8
+
+# GOAL: byte counts are EQUAL by construction -- FP4 is already 2 per byte -- so
+# this isolates locality from bandwidth, and must not be reported as bandwidth.
+# [10] nibble-interleave A1/A2: one load stream for two microbatches
+interleave: build
+    ./rig_sm75/rig_q interleave
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c

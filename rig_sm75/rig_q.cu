@@ -18,6 +18,18 @@
 //                    there? Separates the accumulator question from the operand
 //                    question so we learn which one actually kills it.
 //
+//   [8]  nvfp4       MXFP4 (block 32, E8M0 scale) against NVFP4 (block 16,
+//                    E4M3 scale). Accuracy per bit, on clean and outlier data.
+//
+//   [9]  mxfp8       MXFP4 against MXFP8. On Hopper both run at the same FLOP
+//                    rate, because MXFP4 is emulated onto the FP8 datapath. So
+//                    what does the 4-bit format actually buy?
+//
+//   [10] interleave  Nibble-interleave A1 and A2 into one byte so a single load
+//                    stream serves both microbatches. Identical byte count --
+//                    this is a locality test, not a bandwidth test, and it is
+//                    labelled that way so nobody reports it as the latter.
+//
 //   nvcc -O3 -arch=sm_75 -o rig_q rig_q.cu
 //   ./rig_q              # all of them
 //   ./rig_q narrow       # just the control
@@ -30,6 +42,7 @@
 #include <random>
 #include <algorithm>
 #include "fp4_sim.cuh"
+#include "quant_sim.cuh"
 #define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) {                  \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_));        \
     exit(1); } } while (0)
@@ -355,6 +368,308 @@ static void exp_int8acc() {
     printf("    what [5] and [6] do, and it is exact because nothing is ever multiplied\n");
     printf("    while packed.\n");
 }
+// ============================================================================
+// [8] / [9] block-scaled format comparison
+// ============================================================================
+//
+// Same GEMM, same data, four formats. The reference is fp64 on the unquantized
+// values, so what we measure is purely the format's own error.
+enum Fmt { F_MXFP4, F_NVFP4, F_MXFP8, F_BF16 };
+struct FmtInfo { const char *name; int block; const char *scale; double bits; };
+static FmtInfo fmt_info(Fmt f) {
+    switch (f) {
+        case F_MXFP4: return {"MXFP4", 32, "E8M0", 4.0 + 8.0 / 32};
+        case F_NVFP4: return {"NVFP4", 16, "E4M3", 4.0 + 8.0 / 16};
+        case F_MXFP8: return {"MXFP8", 32, "E8M0", 8.0 + 8.0 / 32};
+        default:      return {"BF16",   0, "-",    16.0};
+    }
+}
+// Quantize one length-K vector in place, block by block.
+static void quantize_vec(std::vector<double> &v, Fmt f) {
+    const int K = (int)v.size();
+    if (f == F_BF16) {
+        for (int i = 0; i < K; ++i) v[i] = (double)to_bf16((float)v[i]);
+        return;
+    }
+    const int B = fmt_info(f).block;
+    for (int b0 = 0; b0 < K; b0 += B) {
+        int be = std::min(b0 + B, K);
+        float amax = 0.f;
+        for (int i = b0; i < be; ++i) amax = std::max(amax, fabsf((float)v[i]));
+        if (amax == 0.f) continue;
+        float s;
+        if (f == F_MXFP4)      s = mx_scale_e2m1(amax);
+        else if (f == F_NVFP4) s = nv_scale_e2m1(amax);
+        else                   s = mx_scale_e4m3(amax);
+        for (int i = b0; i < be; ++i) {
+            float x = (float)v[i] / s;
+            if (f == F_MXFP8) v[i] = (double)(quant_e4m3(x) * s);
+            else              v[i] = (double)(e2m1_value(quant_e2m1_code(x)) * s);
+        }
+    }
+}
+static void fmt_table(const char *title, bool outliers, const std::vector<Fmt> &fmts) {
+    const int M = 48, N = 48, K = 512;
+    std::normal_distribution<double> nd(0.0, 1.0);
+    std::uniform_real_distribution<double> ud(0.0, 1.0);
+    std::vector<double> A((size_t)M * K), B((size_t)N * K);
+    auto fill = [&](std::vector<double> &v) {
+        for (auto &x : v) {
+            x = nd(rng);
+            if (outliers && ud(rng) < 0.01) x *= 20.0;   // 1% heavy tail
+        }
+    };
+    fill(A); fill(B);
+    // fp64 reference, B stored transposed (N x K).
+    std::vector<double> Cref((size_t)M * N, 0.0);
+    for (int m = 0; m < M; ++m)
+        for (int n = 0; n < N; ++n) {
+            double a = 0;
+            for (int k = 0; k < K; ++k) a += A[(size_t)m * K + k] * B[(size_t)n * K + k];
+            Cref[(size_t)m * N + n] = a;
+        }
+    double refn = 0;
+    for (double x : Cref) refn += x * x;
+    refn = sqrt(refn);
+    printf("\n    %s\n", title);
+    printf("    %-7s %6s %7s %9s %9s %11s %11s\n",
+           "format", "block", "scale", "bit/elem", "blk bits", "rel err", "max abs err");
+    for (Fmt f : fmts) {
+        std::vector<double> Aq = A, Bq = B;
+        for (int m = 0; m < M; ++m) {
+            std::vector<double> r(Aq.begin() + (size_t)m * K, Aq.begin() + (size_t)(m + 1) * K);
+            quantize_vec(r, f);
+            std::copy(r.begin(), r.end(), Aq.begin() + (size_t)m * K);
+        }
+        for (int n = 0; n < N; ++n) {
+            std::vector<double> r(Bq.begin() + (size_t)n * K, Bq.begin() + (size_t)(n + 1) * K);
+            quantize_vec(r, f);
+            std::copy(r.begin(), r.end(), Bq.begin() + (size_t)n * K);
+        }
+        double e2 = 0, emax = 0;
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < N; ++n) {
+                double a = 0;
+                for (int k = 0; k < K; ++k) a += Aq[(size_t)m * K + k] * Bq[(size_t)n * K + k];
+                double d = a - Cref[(size_t)m * N + n];
+                e2 += d * d;
+                emax = std::max(emax, fabs(d));
+            }
+        FmtInfo fi = fmt_info(f);
+        char blkbits[16];
+        if (f == F_MXFP4 || f == F_NVFP4)
+            snprintf(blkbits, sizeof blkbits, "%d", bits_of((long long)FP4_PMAX * fi.block) + 1);
+        else
+            snprintf(blkbits, sizeof blkbits, "n/a");
+        printf("    %-7s %6d %7s %9.2f %9s %10.2e%% %11.3e\n",
+               fi.name, fi.block ? fi.block : 0, fi.scale, fi.bits, blkbits,
+               100.0 * sqrt(e2) / refn, emax);
+    }
+}
+static void exp_nvfp4() {
+    printf("\n[8] MXFP4 (block 32, E8M0) vs NVFP4 (block 16, E4M3)\n");
+    printf("    Two axes move at once: block size and scale format. The scale format\n");
+    printf("    is the bigger one -- E8M0 is a bare power of two, so it discards up\n");
+    printf("    to 2x of the block's range before any element is rounded.\n");
+    printf("    M=N=48, K=512, fp64 reference. 'blk bits' is 1+bits(144*block), the\n");
+    printf("    accumulator width an exact block dot product needs.\n");
+    std::vector<Fmt> f = {F_MXFP4, F_NVFP4};
+    fmt_table("clean data, N(0,1):", false, f);
+    fmt_table("1% outliers at 20 sigma (the case block size exists for):", true, f);
+    printf("\n    On Hopper both are emulated the same way and cost the same FLOPs, so\n");
+    printf("    the extra 0.25 bit/elem of NVFP4 is the entire price. It is also the\n");
+    printf("    format Blackwell runs natively, which makes it the forward-compatible\n");
+    printf("    choice even where the accuracy gap is small.\n");
+}
+static void exp_mxfp8() {
+    printf("\n[9] MXFP4 vs MXFP8 -- what does the 4-bit format actually buy on Hopper?\n");
+    printf("    MXFP4 has to be expanded to E4M3 to reach the tensor core, so it runs\n");
+    printf("    at the FP8 rate at best (1979 TFLOP/s dense) and pays an unpack on\n");
+    printf("    top. MXFP8 runs there natively with no unpack at all.\n");
+    std::vector<Fmt> f = {F_MXFP4, F_NVFP4, F_MXFP8, F_BF16};
+    fmt_table("clean data, N(0,1):", false, f);
+    fmt_table("1% outliers at 20 sigma:", true, f);
+    printf("\n    Same FLOPs, roughly half the bytes, more error. So on Hopper the\n");
+    printf("    4-bit formats buy memory, bandwidth and interconnect -- never FLOPs.\n");
+    printf("    That is the whole argument for [11]: if the only thing FP4 buys is\n");
+    printf("    bytes, the payoff has to be collected where bytes are expensive, and\n");
+    printf("    nothing on a node is more expensive per byte than the link.\n");
+}
+// ============================================================================
+// [10] interleave -- one load stream for two microbatches
+// ============================================================================
+//
+// SEP: A1 and A2 are separate arrays, each nibble-packed 2 elements per byte
+//      along K. A tile needs one 4-byte load from each.
+// ILV: one array, byte k holds A1[k] in the low nibble and A2[k] in the high.
+//      A tile needs two 4-byte loads from one array.
+//
+// IDENTICAL byte count -- FP4 is already 2 elements per byte either way. This
+// is a locality and stream-count test. If it wins, it wins on cache behaviour,
+// not on bandwidth, and it must not be reported as the latter.
+#define IL_TS 16
+#define IL_TK 64
+#define IL_PAD 4
+__device__ __forceinline__ int q4(int code) {
+    const int t[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+    int v = t[code & 7];
+    return (code & 8) ? -v : v;
+}
+// SEP: each thread pulls one 32-bit word = 8 consecutive k of one matrix.
+__global__ __launch_bounds__(IL_TS * IL_TS) void il_sep(
+        const uint32_t *__restrict__ A1p, const uint32_t *__restrict__ A2p,
+        const signed char *__restrict__ Bt, int *__restrict__ C1, int *__restrict__ C2,
+        int M, int N, int K) {
+    __shared__ __align__(16) signed char sA1[IL_TS][IL_TK + IL_PAD];
+    __shared__ __align__(16) signed char sA2[IL_TS][IL_TK + IL_PAD];
+    __shared__ __align__(16) signed char sB[IL_TS][IL_TK + IL_PAD];
+    const int row = blockIdx.y * IL_TS + threadIdx.y;
+    const int col = blockIdx.x * IL_TS + threadIdx.x;
+    const int tid = threadIdx.y * IL_TS + threadIdx.x;        // 0..255
+    const int wpr = IL_TK / 8;                                // words per row = 8
+    const int half = tid >> 7;                                // 0 -> A1, 1 -> A2
+    const int lr = (tid & 127) / wpr, lw = (tid & 127) % wpr; // 16 rows x 8 words
+    const int K8 = K / 8;
+    int acc1 = 0, acc2 = 0;
+    for (int t = 0; t < K; t += IL_TK) {
+        // All 256 threads load one word each: half from A1, half from A2, so the
+        // two layouts issue the same number of loads from the same thread count.
+        {
+            const uint32_t *src = half ? A2p : A1p;
+            uint32_t w = src[(size_t)(blockIdx.y * IL_TS + lr) * K8 + (t / 8) + lw];
+            signed char *dst = half ? &sA2[lr][lw * 8] : &sA1[lr][lw * 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dst[j] = (signed char)q4((int)((w >> (4 * j)) & 0xF));
+        }
+        if (tid < IL_TS * (IL_TK / 4)) {
+            int br = tid / (IL_TK / 4), bc = (tid % (IL_TK / 4)) * 4;
+            *(int *)&sB[br][bc] = *(const int *)&Bt[(size_t)(blockIdx.x * IL_TS + br) * K + t + bc];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < IL_TK; kk += 4) {
+            int a1 = *(const int *)&sA1[threadIdx.y][kk];
+            int a2 = *(const int *)&sA2[threadIdx.y][kk];
+            int b  = *(const int *)&sB[threadIdx.x][kk];
+            acc1 = __dp4a(a1, b, acc1);
+            acc2 = __dp4a(a2, b, acc2);
+        }
+        __syncthreads();
+    }
+    C1[(size_t)row * N + col] = acc1;
+    C2[(size_t)row * N + col] = acc2;
+}
+// ILV: each thread pulls one 32-bit word = 4 consecutive k of BOTH matrices.
+__global__ __launch_bounds__(IL_TS * IL_TS) void il_ilv(
+        const uint32_t *__restrict__ Ai,
+        const signed char *__restrict__ Bt, int *__restrict__ C1, int *__restrict__ C2,
+        int M, int N, int K) {
+    __shared__ __align__(16) signed char sA1[IL_TS][IL_TK + IL_PAD];
+    __shared__ __align__(16) signed char sA2[IL_TS][IL_TK + IL_PAD];
+    __shared__ __align__(16) signed char sB[IL_TS][IL_TK + IL_PAD];
+    const int row = blockIdx.y * IL_TS + threadIdx.y;
+    const int col = blockIdx.x * IL_TS + threadIdx.x;
+    const int tid = threadIdx.y * IL_TS + threadIdx.x;
+    const int wpr = IL_TK / 4;                                // 16 words per row
+    const int lr = tid / wpr, lw = tid % wpr;                 // exactly 16 rows
+    const int K4 = K / 4;
+    int acc1 = 0, acc2 = 0;
+    for (int t = 0; t < K; t += IL_TK) {
+        uint32_t w = Ai[(size_t)(blockIdx.y * IL_TS + lr) * K4 + (t / 4) + lw];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int byte = (int)((w >> (8 * j)) & 0xFF);
+            sA1[lr][lw * 4 + j] = (signed char)q4(byte & 0xF);
+            sA2[lr][lw * 4 + j] = (signed char)q4(byte >> 4);
+        }
+        if (tid < IL_TS * (IL_TK / 4)) {
+            int br = tid / (IL_TK / 4), bc = (tid % (IL_TK / 4)) * 4;
+            *(int *)&sB[br][bc] = *(const int *)&Bt[(size_t)(blockIdx.x * IL_TS + br) * K + t + bc];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < IL_TK; kk += 4) {
+            int a1 = *(const int *)&sA1[threadIdx.y][kk];
+            int a2 = *(const int *)&sA2[threadIdx.y][kk];
+            int b  = *(const int *)&sB[threadIdx.x][kk];
+            acc1 = __dp4a(a1, b, acc1);
+            acc2 = __dp4a(a2, b, acc2);
+        }
+        __syncthreads();
+    }
+    C1[(size_t)row * N + col] = acc1;
+    C2[(size_t)row * N + col] = acc2;
+}
+static void exp_interleave() {
+    const int M = 512, N = 512, K = 4096;
+    printf("\n[10] nibble-interleaved A1/A2: one load stream for two microbatches\n");
+    printf("    M=%d N=%d K=%d. SEP reads two FP4 arrays; ILV reads one array whose\n", M, N, K);
+    printf("    every byte carries A1[k] low and A2[k] high. Same bytes, same load\n");
+    printf("    count, same dp4a work. Only the number of streams differs.\n");
+    std::uniform_int_distribution<int> cd(0, 14);
+    std::vector<uint8_t> c1v((size_t)M * K), c2v((size_t)M * K);
+    for (auto &v : c1v) v = (uint8_t)LEGAL[cd(rng)];
+    for (auto &v : c2v) v = (uint8_t)LEGAL[cd(rng)];
+    std::vector<signed char> hBt((size_t)N * K);
+    for (auto &v : hBt) v = (signed char)e2m1_q(LEGAL[cd(rng)]);
+    std::vector<uint8_t> sep1((size_t)M * K / 2), sep2((size_t)M * K / 2), ilv((size_t)M * K);
+    for (int m = 0; m < M; ++m)
+        for (int k = 0; k < K; ++k) {
+            size_t i = (size_t)m * K + k;
+            if (k & 1) {
+                sep1[i / 2] |= (uint8_t)(c1v[i] << 4);
+                sep2[i / 2] |= (uint8_t)(c2v[i] << 4);
+            } else {
+                sep1[i / 2] = c1v[i];
+                sep2[i / 2] = c2v[i];
+            }
+            ilv[i] = (uint8_t)(c1v[i] | (c2v[i] << 4));
+        }
+    uint32_t *dA1, *dA2, *dAi;
+    signed char *dBt;
+    int *dC1, *dC2, *eC1, *eC2;
+    CHECK(cudaMalloc(&dA1, sep1.size())); CHECK(cudaMalloc(&dA2, sep2.size()));
+    CHECK(cudaMalloc(&dAi, ilv.size()));  CHECK(cudaMalloc(&dBt, hBt.size()));
+    CHECK(cudaMalloc(&dC1, (size_t)M * N * 4)); CHECK(cudaMalloc(&dC2, (size_t)M * N * 4));
+    CHECK(cudaMalloc(&eC1, (size_t)M * N * 4)); CHECK(cudaMalloc(&eC2, (size_t)M * N * 4));
+    CHECK(cudaMemcpy(dA1, sep1.data(), sep1.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dA2, sep2.data(), sep2.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dAi, ilv.data(), ilv.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dBt, hBt.data(), hBt.size(), cudaMemcpyHostToDevice));
+    dim3 blk(IL_TS, IL_TS), grd((unsigned)(N / IL_TS), (unsigned)(M / IL_TS));
+    Timer tm;
+    auto best_of = [&](auto fn) {
+        fn(); CHECK(cudaDeviceSynchronize());
+        float best = 1e30f;
+        for (int r = 0; r < 5; ++r) {
+            tm.start();
+            for (int i = 0; i < 10; ++i) fn();
+            best = std::min(best, tm.stop() / 10);
+        }
+        return best;
+    };
+    float ts = best_of([&] { il_sep<<<grd, blk>>>(dA1, dA2, dBt, dC1, dC2, M, N, K); });
+    float ti = best_of([&] { il_ilv<<<grd, blk>>>(dAi, dBt, eC1, eC2, M, N, K); });
+    CHECK(cudaDeviceSynchronize());
+    std::vector<int> h1((size_t)M * N), h2((size_t)M * N), g1((size_t)M * N), g2((size_t)M * N);
+    CHECK(cudaMemcpy(h1.data(), dC1, h1.size() * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(h2.data(), dC2, h2.size() * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(g1.data(), eC1, g1.size() * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(g2.data(), eC2, g2.size() * 4, cudaMemcpyDeviceToHost));
+    size_t bad = 0;
+    for (size_t i = 0; i < h1.size(); ++i) if (h1[i] != g1[i] || h2[i] != g2[i]) ++bad;
+    double bytes = (double)M * K;                      // identical for both
+    double flop = 2.0 * 2.0 * M * N * K;
+    printf("\n    %-24s %9s %10s %10s\n", "layout", "ms", "A bytes", "GOP/s");
+    printf("    %-24s %9.3f %9.1fM %10.1f\n", "SEP: two FP4 arrays", ts, bytes / 1e6, flop / ts * 1e-6);
+    printf("    %-24s %9.3f %9.1fM %10.1f   %.2fx\n", "ILV: one interleaved", ti, bytes / 1e6,
+           flop / ti * 1e-6, ts / ti);
+    printf("    agreement: %s (%zu of %zu outputs differ)\n",
+           bad ? "MISMATCH" : "identical", bad, h1.size());
+    printf("\n    Byte counts are equal by construction, so whatever this shows is\n");
+    printf("    locality, not bandwidth. FP4 is already two elements per byte; there\n");
+    printf("    is no second densification to collect on the operand side.\n");
+}
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -372,6 +687,9 @@ int main(int argc, char **argv) {
     };
     if (want("narrow")) exp_narrow();
     if (want("int8acc")) exp_int8acc();
+    if (want("nvfp4")) exp_nvfp4();
+    if (want("mxfp8")) exp_mxfp8();
+    if (want("interleave")) exp_interleave();
     printf("\n");
     return 0;
 }
