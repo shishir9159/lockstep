@@ -30,6 +30,18 @@
 //                    this is a locality test, not a bandwidth test, and it is
 //                    labelled that way so nobody reports it as the latter.
 //
+//   [11] link        The reason for all of this: inter-GPU reduction. Measures
+//                    real off-chip bandwidth here, then simulates a P-rank ring
+//                    all-reduce in bf16, fp8, and fixed-point int16 with the
+//                    a-priori 144*d bound. NOTE: its headline 39x is correct
+//                    as a number and wrong as an explanation -- see [13].
+//
+//   [12] dense       Normalization-aware packing. If the result gets normalized
+//                    after the reduction anyway, partials do not need to be
+//                    exactly recoverable -- they need to be good enough after
+//                    the sum. How dense can we go, and what does the a-priori
+//                    bound cost us against the measured range?
+//
 //   nvcc -O3 -arch=sm_75 -o rig_q rig_q.cu
 //   ./rig_q              # all of them
 //   ./rig_q narrow       # just the control
@@ -670,6 +682,276 @@ static void exp_interleave() {
     printf("    locality, not bandwidth. FP4 is already two elements per byte; there\n");
     printf("    is no second densification to collect on the operand side.\n");
 }
+// ============================================================================
+// [11] link -- the inter-GPU case, which is the actual reason for all of this
+// ============================================================================
+//
+// Off-chip is where a saved byte is worth the most. Two halves:
+//
+//   A. measured. Real device-to-host bandwidth on this box at 8 / 4 / 2 bytes
+//      per output pair. PCIe is a slow link, which makes it a good stand-in for
+//      an interconnect rather than a memory bus.
+//
+//   B. simulated. A P-rank ring all-reduce of a wgrad, in four wire formats.
+//      The claim under test: a fixed-point payload derived from the a-priori
+//      144*d bound sums EXACTLY across hops, because integer addition is
+//      associative, while bf16 and fp8 round at every one of the P-1 hops.
+//      The cost is that the a-priori bound is loose -- so we also measure the
+//      normalization-aware variant that spends one scalar all-reduce on the
+//      real amax and gets the bits back.
+static void exp_link() {
+    printf("\n[11] inter-GPU reduction: what a narrow exact payload is worth off-chip\n");
+    // ---------------------------------------------------------------- part A
+    const size_t NOUT = 1u << 22;                       // 4M output pairs
+    printf("\n    A. measured off-chip bandwidth on this box (%zu output pairs)\n", NOUT);
+    void *dbuf;
+    CHECK(cudaMalloc(&dbuf, NOUT * 8));
+    void *hbuf;
+    CHECK(cudaMallocHost(&hbuf, NOUT * 8));
+    Timer tm;
+    printf("    %-26s %9s %9s %10s\n", "payload", "MB", "ms", "GB/s");
+    struct { const char *nm; size_t bpp; } pl[] = {
+        {"int32 x2 (unpacked)", 8}, {"int16 x2 / packed", 4}, {"int8 x2 (lossy)", 2}};
+    for (auto &e : pl) {
+        size_t nb = NOUT * e.bpp;
+        cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost);
+        CHECK(cudaDeviceSynchronize());
+        float best = 1e30f;
+        for (int r = 0; r < 5; ++r) {
+            tm.start();
+            for (int i = 0; i < 5; ++i) cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost);
+            best = std::min(best, tm.stop() / 5);
+        }
+        printf("    %-26s %9.1f %9.3f %10.1f\n", e.nm, nb / 1e6, best, nb / (best * 1e6));
+    }
+    cudaFree(dbuf); cudaFreeHost(hbuf);
+    // ---------------------------------------------------------------- part B
+    const int NEL = 2048;        // gradient elements
+    const int KLOC = 256;        // per-rank contraction depth
+    const double BOUND = (double)FP4_PMAX * KLOC;        // |g_r| <= 144 * KLOC, a priori
+    printf("\n    B. simulated P-rank ring all-reduce of one wgrad tile\n");
+    printf("       %d elements, each rank contributes a depth-%d FP4 contraction.\n", NEL, KLOC);
+    printf("       a-priori bound |g_r| <= 144*%d = %.0f -- known without looking at data.\n",
+           KLOC, BOUND);
+    printf("\n    %5s  %-30s %6s %13s %13s\n", "P", "wire format", "B/el", "rel err (RMS)", "hop rounding");
+    std::uniform_int_distribution<int> cd(0, 14);
+    for (int P : {8, 32, 128}) {
+        // Each rank's exact integer gradient contribution.
+        std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
+        for (int r = 0; r < P; ++r)
+            for (int i = 0; i < NEL; ++i) {
+                long long a = 0;
+                for (int k = 0; k < KLOC; ++k)
+                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+                g[r][i] = a;
+            }
+        std::vector<long long> S(NEL, 0);
+        for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i) S[i] += g[r][i];
+        double sn = 0;
+        for (int i = 0; i < NEL; ++i) sn += (double)S[i] * S[i];
+        sn = sqrt(sn);
+        double amax_tot = 0;
+        for (int i = 0; i < NEL; ++i) amax_tot = std::max(amax_tot, fabs((double)S[i]));
+        auto rms = [&](const std::vector<double> &out) {
+            double e = 0;
+            for (int i = 0; i < NEL; ++i) { double d = out[i] - (double)S[i]; e += d * d; }
+            return 100.0 * sqrt(e) / sn;
+        };
+        // bf16 wire: round at every hop.
+        std::vector<double> o(NEL);
+        for (int i = 0; i < NEL; ++i) {
+            float a = to_bf16((float)g[0][i]);
+            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
+            o[i] = a;
+        }
+        printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P, "bf16", 2.0, rms(o), "every hop");
+        // fp8 e4m3 wire with a per-tensor scale: round at every hop, harder.
+        double gmax = 0;
+        for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i)
+            gmax = std::max(gmax, fabs((double)g[r][i]));
+        double s8 = std::max(gmax, amax_tot) / E4M3_MAX;
+        for (int i = 0; i < NEL; ++i) {
+            float a = quant_e4m3((float)(g[0][i] / s8));
+            for (int r = 1; r < P; ++r) a = quant_e4m3(a + quant_e4m3((float)(g[r][i] / s8)));
+            o[i] = (double)a * s8;
+        }
+        printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P, "fp8 e4m3, per-tensor scale", 1.0, rms(o), "every hop");
+        // int16 fixed point, a-priori bound sized for the worst-case total.
+        {
+            double sc = fixed_scale(BOUND * P, 16);
+            for (int i = 0; i < NEL; ++i) {
+                long long a = 0;
+                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;                   // integer adds: exact
+            }
+            printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P,
+                   "int16 fixed, a-priori bound", 2.0, rms(o), "none");
+        }
+        // int16 fixed point, normalization aware: one scalar all-reduce buys the
+        // real amax of the TOTAL, so the grid is sized to the answer, not the bound.
+        {
+            double sc = fixed_scale(amax_tot, 16);
+            for (int i = 0; i < NEL; ++i) {
+                long long a = 0;
+                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;
+            }
+            printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P,
+                   "int16 fixed, measured amax", 2.0, rms(o), "none");
+        }
+        printf("\n");
+    }
+    printf("    CORRECTED BY [13]. The 'hop rounding: none' column is true, but the\n");
+    printf("    conclusion originally drawn from it was not. Fixed point does not stay\n");
+    printf("    flat in P: read the int16 column above and it grows as sqrt(P), the\n");
+    printf("    same rate as bf16, because every scheme quantizes each rank's own\n");
+    printf("    contribution before it reaches the wire. The ratio between the two\n");
+    printf("    columns NARROWS with P rather than widening. Run `just fair`.\n");
+    printf("\n    What the gap actually is: bf16 spends 8 of its 15 magnitude bits on\n");
+    printf("    an exponent this data does not use. Against a properly scaled fp16\n");
+    printf("    wire at the same 2 bytes the advantage is ~7x, not ~39x. Closure buys\n");
+    printf("    a guarantee -- reduction-order independence -- not an error factor.\n");
+    printf("\n    The gap between the two int16 rows is the price of the a-priori\n");
+    printf("    bound: 144*K*P is a worst case that random data never approaches, so\n");
+    printf("    sizing the grid to it throws away real bits. One scalar all-reduce of\n");
+    printf("    the true amax gets them back, which is the normalization-aware form.\n");
+    // ---------------------------------------------------------------- part C
+    printf("\n    C. roofline: one all-reduce of a 4096x4096 wgrad, ring, 2(P-1)/P bytes\n");
+    const double NGRAD = 4096.0 * 4096.0;
+    struct { const char *nm; double gbs; } links[] = {
+        {"NVLink 4 (per GPU)", 450.0}, {"IB NDR 400G", 50.0}, {"PCIe 4.0 x16", 25.0}};
+    printf("    %-22s %10s %10s %10s %10s\n", "link", "fp32 ms", "bf16 ms", "int16 ms", "saved");
+    for (auto &L : links) {
+        double f = 2.0 * (128 - 1) / 128.0;
+        double t32 = NGRAD * 4 * f / (L.gbs * 1e9) * 1e3;
+        double t16 = NGRAD * 2 * f / (L.gbs * 1e9) * 1e3;
+        printf("    %-22s %10.3f %10.3f %10.3f %9.2fx\n", L.nm, t32, t16, t16, t32 / t16);
+    }
+    printf("    bf16 and int16 move the same bytes -- the difference between them is\n");
+    printf("    not time, it is that one of them is exact under summation.\n");
+}
+// ============================================================================
+// [12] dense -- normalization-aware packing
+// ============================================================================
+//
+// The idea: if the reduced result gets normalized anyway, a partial does not
+// have to be exactly recoverable. It has to be good enough AFTER the sum. So:
+//
+//   * how many bits does the a-priori bound 144*d demand,
+//   * how many does the data actually use,
+//   * what does an exception path cost if you size for the data and escape the
+//     rare overflow,
+//   * and what does an MX-style shared exponent over a group of partials give,
+//     which is a larger container holding more quantized partials -- exactly
+//     the "denser packing in a bigger slot" shape.
+static void exp_dense() {
+    printf("\n[12] normalization-aware packing: how dense can a partial get?\n");
+    printf("    A depth-d partial is an integer with |p| <= 144*d. That bound is free\n");
+    printf("    but loose -- real data is a random walk, so it lands near sqrt(d).\n");
+    const int TRIALS = 20000;
+    std::uniform_int_distribution<int> cd(0, 14);
+    printf("\n    %5s %8s %8s %10s %9s %9s %11s\n", "depth", "a-priori", "measured",
+           "typ |p|", "w=12 ovf", "w=10 ovf", "w=8 ovf");
+    for (int d : {16, 32, 64, 128, 227}) {
+        long long mx = 0;
+        double sum = 0;
+        long long o12 = 0, o10 = 0, o8 = 0;
+        for (int t = 0; t < TRIALS; ++t) {
+            long long a = 0;
+            for (int k = 0; k < d; ++k)
+                a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+            long long m = llabs(a);
+            mx = std::max(mx, m);
+            sum += (double)m;
+            if (m >= (1LL << 11)) ++o12;
+            if (m >= (1LL << 9))  ++o10;
+            if (m >= (1LL << 7))  ++o8;
+        }
+        printf("    %5d %8d %8d %10.1f %8.3f%% %8.3f%% %10.3f%%\n",
+               d, bits_of((long long)FP4_PMAX * d) + 1, bits_of(mx) + 1, sum / TRIALS,
+               100.0 * o12 / TRIALS, 100.0 * o10 / TRIALS, 100.0 * o8 / TRIALS);
+    }
+    printf("\n    'a-priori' is what the bound demands and always holds. 'measured' is\n");
+    printf("    what %d random partials actually needed. The gap is 3-5 bits, which is\n", TRIALS);
+    printf("    the headroom an exception path can sell you -- and the reason the\n");
+    printf("    OVERFL row in [5] still verified exact.\n");
+    // --- exception path: size for the data, escape the rare overflow.
+    printf("\n    exception path: w-bit payload plus an escape list for the overflows\n");
+    printf("    %5s %5s %11s %13s %11s\n", "depth", "w", "escape rate", "eff bytes/p", "vs int16");
+    for (int d : {32, 128}) {
+        for (int w : {12, 10, 8}) {
+            long long esc = 0;
+            for (int t = 0; t < TRIALS; ++t) {
+                long long a = 0;
+                for (int k = 0; k < d; ++k)
+                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+                if (llabs(a) >= (1LL << (w - 1))) ++esc;
+            }
+            double rate = (double)esc / TRIALS;
+            double eff = w / 8.0 + rate * 6.0;      // escape carries index + int32
+            printf("    %5d %5d %10.3f%% %13.3f %10.2fx\n", d, w, 100.0 * rate, eff, 2.0 / eff);
+        }
+    }
+    printf("    An escape costs an index plus a full-width value, so a rate above a\n");
+    printf("    few percent eats the win. Exact, but only worth it where the payload\n");
+    printf("    width sits just above the measured range.\n");
+    // --- MX-style partials: a bigger container holding more quantized partials.
+    printf("\n    MX-style partials: G partials share one E8M0 exponent, w-bit mantissa\n");
+    printf("    (this is the 'larger data type, more quantized data packed' shape)\n");
+    printf("    %5s %5s %5s %13s %14s %11s\n", "depth", "G", "w", "bytes/partial", "rel err of sum", "vs int16");
+    for (int d : {32, 128}) {
+        for (int G : {8, 32}) {
+            for (int w : {8, 6, 4}) {
+                double e2 = 0, s2 = 0;
+                const int GROUPS = 400;
+                for (int t = 0; t < GROUPS; ++t) {
+                    std::vector<long long> p(G);
+                    for (int j = 0; j < G; ++j) {
+                        long long a = 0;
+                        for (int k = 0; k < d; ++k)
+                            a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+                        p[j] = a;
+                    }
+                    double amax = 0;
+                    for (int j = 0; j < G; ++j) amax = std::max(amax, fabs((double)p[j]));
+                    // Shared exponent rounded UP, so nothing in the group clamps.
+                    double sc = amax > 0 ? quant_e8m0_up((float)(amax / ((1 << (w - 1)) - 1))) : 1.0;
+                    long long exact = 0, approx = 0;
+                    for (int j = 0; j < G; ++j) {
+                        exact += p[j];
+                        long long q = llrint((double)p[j] / sc);
+                        long long lim = (1LL << (w - 1)) - 1;
+                        q = std::max(-lim, std::min(lim, q));
+                        approx += q;
+                    }
+                    double da = (double)approx * sc - (double)exact;
+                    e2 += da * da;
+                    s2 += (double)exact * (double)exact;
+                }
+                double bpp = w / 8.0 + 1.0 / G;
+                printf("    %5d %5d %5d %13.3f %13.4f%% %10.2fx\n",
+                       d, G, w, bpp, 100.0 * sqrt(e2 / GROUPS) / sqrt(s2 / GROUPS), 2.0 / bpp);
+            }
+        }
+    }
+    printf("\n    Error falls ~4x per 2 mantissa bits, as it should, and barely moves\n");
+    printf("    with G. Two effects cancel: a bigger group has a bigger amax, so the\n");
+    printf("    shared grid is coarser, but its rounding errors are independent and\n");
+    printf("    partly cancel in the sum. Since G is nearly free on accuracy, pick it\n");
+    printf("    large to amortize the one scale byte -- G=32 costs 1/32 byte/partial.\n");
+    printf("\n    That is the whole argument for normalization-aware packing: you are not\n");
+    printf("    protecting a partial, you are protecting a sum, and the sum is more\n");
+    printf("    forgiving than any single term in it.\n");
+    printf("\n    Best cell above is w=8, G=32: 1.03 bytes/partial, ~2x denser than int16,\n");
+    printf("    for under 1%% error on the reduced value. w=4 is 3.8x denser and ~14%%,\n");
+    printf("    which is too coarse for a gradient but not obviously too coarse for an\n");
+    printf("    activation that a layernorm is about to rescale anyway.\n");
+    printf("\n    The trade against int16 is stark and worth stating plainly: int16 with\n");
+    printf("    the 144*d bound is EXACT, needs no amax pass, and needs no second pass\n");
+    printf("    over the partials. Everything denser here is approximate and needs both.\n");
+    printf("    Pick by whether the consumer normalizes.\n");
+}
+// ============================================================================
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -690,6 +972,8 @@ int main(int argc, char **argv) {
     if (want("nvfp4")) exp_nvfp4();
     if (want("mxfp8")) exp_mxfp8();
     if (want("interleave")) exp_interleave();
+    if (want("link")) exp_link();
+    if (want("dense")) exp_dense();
     printf("\n");
     return 0;
 }

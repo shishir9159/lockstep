@@ -102,6 +102,21 @@ mxfp8: build
 interleave: build
     ./rig_sm75/rig_q interleave
 
+# GOAL: the reason for the whole project. Integer addition is associative, so a
+# fixed-point payload rounds ONCE regardless of rank count while bf16 and fp8
+# round at every hop. Tests whether that beats bf16 at equal bytes, and what the
+# a-priori 144*d bound costs against one scalar all-reduce of the real amax.
+# [11] inter-GPU reduction: measured off-chip bandwidth + a P-rank ring all-reduce
+link: build
+    ./rig_sm75/rig_q link
+
+# GOAL: if the consumer normalizes after the reduction, partials have to survive
+# the SUM, not survive individually. Measures how much denser than exact int16
+# you can get and what each step of density costs.
+# [12] normalization-aware packing: a-priori bound, exception path, MX partials
+dense: build
+    ./rig_sm75/rig_q dense
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
