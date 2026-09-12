@@ -117,6 +117,24 @@ link: build
 dense: build
     ./rig_sm75/rig_q dense
 
+# GOAL: control [11], which reported 39x for int16 over bf16 and blamed
+# associativity. Its own error-vs-P columns contradict that. This runs the
+# baseline [11] skipped -- fp16 with a per-tensor scale, same 2 bytes -- and
+# runs ONE format both ways, encoded once vs re-encoded at every hop, so the
+# bits effect and the closure effect are separated instead of summed.
+# [13] is the 39x bits or associativity? run the baseline [11] never ran
+fair: build
+    ./rig_sm75/rig_q fair
+
+# GOAL: everything so far ran at 4096 elements, K=256, P<=128. A 1B model
+# all-reduces 1e9 elements with K in the thousands over hundreds of ranks.
+# Prices the three things that get worse in that direction: the a-priori bound
+# loosening as sqrt(K*P), a single global amax dying on heavy tails, and the
+# extra collective needed to agree per-chunk scales across ranks.
+# [14] does the fixed-point wire survive 1B/7B/70B/405B parameters?
+llm: build
+    ./rig_sm75/rig_q llm
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c

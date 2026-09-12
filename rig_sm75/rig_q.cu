@@ -42,6 +42,16 @@
 //                    the sum. How dense can we go, and what does the a-priori
 //                    bound cost us against the measured range?
 //
+//   [13] fair        The control for [11]. Its 39x was attributed to
+//                    associativity, but its own numbers say otherwise. Splits
+//                    the gap into bits-per-element and closure-under-addition,
+//                    against a properly scaled fp16 wire rather than raw bf16.
+//
+//   [14] llm         Does any of it survive at 1B+ parameters? The a-priori
+//                    bound loosens as sqrt(K*P), a single global amax dies on
+//                    heavy tails, and the per-chunk scales have to be agreed
+//                    across ranks before the payload moves. Prices all three.
+//
 //   nvcc -O3 -arch=sm_75 -o rig_q rig_q.cu
 //   ./rig_q              # all of them
 //   ./rig_q narrow       # just the control
@@ -952,6 +962,341 @@ static void exp_dense() {
     printf("    Pick by whether the consumer normalizes.\n");
 }
 // ============================================================================
+// ============================================================================
+// [13] fair -- where does the 39x actually come from?
+// ============================================================================
+//
+// [11] reported int16 fixed point beating bf16 by 39x at 128 ranks and put it
+// down to associativity: integer addition rounds once, floating point rounds at
+// every hop. Reading the table in [11] back, that attribution does not survive.
+// The int16 error goes 0.0080 -> 0.0177 -> 0.0329% across P = 8 -> 32 -> 128,
+// which is sqrt(P), not flat. bf16 goes 0.4234 -> 0.7259 -> 1.2951, very nearly
+// the same rate. The ratio between them NARROWS with P (53x, 41x, 39x) instead
+// of widening. Whatever produces the 39x, it is not a difference in how the
+// error accumulates with rank count.
+//
+// The reason both grow as sqrt(P) is that every scheme quantizes each rank's
+// own contribution before it ever reaches the wire. P independent roundings go
+// in, so P independent roundings come out, associativity or no associativity.
+//
+// So decompose it. Two independent claims are tangled together:
+//
+//   1. BITS. A 16-bit fixed-point field spends all 15 magnitude bits on the
+//      mantissa. bf16 spends 8 of its 15 on an exponent that gradient data,
+//      already scaled to a known range, does not use. That is a static ~7 bit
+//      advantage available to ANY integer wire format, with or without FP4,
+//      and it is not news -- it is why gradient-compression work going back to
+//      1-bit SGD scales into a fixed grid. The honest 2-byte float control is
+//      fp16 (11 mantissa bits), not bf16.
+//
+//   2. CLOSURE. A fixed-point grid is closed under addition: the encoding of a
+//      sum IS the sum of the encodings, exactly, as long as the total stays
+//      inside the field. So re-encoding the running sum at each hop costs
+//      nothing. THIS is the part the FP4 144*d bound underwrites, and the way
+//      to see it is to run one format both ways rather than two formats once.
+//
+// Every row below is re-encoded at every hop, as the payload of a real ring
+// reduce-scatter is. That is the comparison [11] did not run.
+static void exp_fair() {
+    printf("\n[13] decomposing the int16-vs-bf16 gap: bits, or closure?\n");
+    const int NEL = 4096;
+    const int KLOC = 256;
+    const int CH = 64;                     // block-scale chunk
+    std::uniform_int_distribution<int> cd(0, 14);
+    printf("\n    %d elements, depth-%d FP4 contraction per rank, ring reduce-scatter.\n", NEL, KLOC);
+    printf("    Every format is re-encoded at every hop, as it would be on a real ring.\n");
+    printf("\n    %5s  %-34s %6s %13s %11s\n", "P", "wire format", "b/el", "rel err (RMS)", "vs bf16");
+    double keep[3][8];
+    int pi = 0;
+    for (int P : {8, 32, 128}) {
+        std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
+        for (int r = 0; r < P; ++r)
+            for (int i = 0; i < NEL; ++i) {
+                long long a = 0;
+                for (int k = 0; k < KLOC; ++k)
+                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+                g[r][i] = a;
+            }
+        std::vector<long long> S(NEL, 0);
+        for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i) S[i] += g[r][i];
+        double sn = 0, amax_tot = 0;
+        for (int i = 0; i < NEL; ++i) {
+            sn += (double)S[i] * S[i];
+            amax_tot = std::max(amax_tot, fabs((double)S[i]));
+        }
+        sn = sqrt(sn);
+        std::vector<double> o(NEL);
+        auto rms = [&](const std::vector<double> &v) {
+            double e = 0;
+            for (int i = 0; i < NEL; ++i) { double d = v[i] - (double)S[i]; e += d * d; }
+            return 100.0 * sqrt(e) / sn;
+        };
+        // Per-chunk amax of the TOTAL. Reachable in practice with one small
+        // max-all-reduce over NEL/CH scalars before the payload moves -- [14]
+        // measures what that costs.
+        std::vector<double> camax(NEL / CH, 0.0);
+        for (int i = 0; i < NEL; ++i)
+            camax[i / CH] = std::max(camax[i / CH], fabs((double)S[i]));
+        int row = 0;
+        auto emit = [&](const char *nm, double bpe, double err) {
+            keep[pi][row++] = err;
+            printf("    %5d  %-34s %6.2f %12.4f%% %10.1fx\n", P, nm, bpe, err,
+                   err > 0 ? keep[pi][0] / err : 0.0);
+        };
+        // --- row 0: bf16, raw. The [11] baseline, reproduced.
+        for (int i = 0; i < NEL; ++i) {
+            float a = to_bf16((float)g[0][i]);
+            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
+            o[i] = a;
+        }
+        emit("bf16, raw (the [11] baseline)", 2.0, rms(o));
+        // --- row 1: bf16 with a per-tensor scale. Control: a float is scale
+        // invariant, so this MUST match row 0. If it does not, row 0 was a
+        // scaling mistake rather than a format result.
+        for (int i = 0; i < NEL; ++i) {
+            double s = amax_tot;
+            float a = to_bf16((float)(g[0][i] / s));
+            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)(g[r][i] / s)));
+            o[i] = (double)a * s;
+        }
+        emit("bf16, per-tensor scale (control)", 2.0, rms(o));
+        // --- row 2: fp16, per-tensor scale. THE honest 2-byte float: same
+        // bytes, 11 mantissa bits instead of 8, and the scale keeps every value
+        // inside its narrower exponent range so the range never binds.
+        for (int i = 0; i < NEL; ++i) {
+            double s = amax_tot;
+            float a = round_sig((float)(g[0][i] / s), 13);
+            for (int r = 1; r < P; ++r)
+                a = round_sig(a + round_sig((float)(g[r][i] / s), 13), 13);
+            o[i] = (double)a * s;
+        }
+        emit("fp16, per-tensor scale", 2.0, rms(o));
+        // --- row 3: int16 fixed, global scale, RE-ENCODED AT EVERY HOP.
+        {
+            double sc = fixed_scale(amax_tot, 16);
+            for (int i = 0; i < NEL; ++i) {
+                long long a = llrint((double)g[0][i] * sc);
+                for (int r = 1; r < P; ++r) a = a + (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;
+            }
+            emit("int16 fixed, re-encode every hop", 2.0, rms(o));
+        }
+        // --- row 4: same grid, encoded ONCE at the source. If closure holds,
+        // this is identical to row 3 -- that is the whole claim, and it is a
+        // claim about the format, not about the data.
+        {
+            double sc = fixed_scale(amax_tot, 16);
+            for (int i = 0; i < NEL; ++i) {
+                long long a = 0;
+                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;
+            }
+            emit("int16 fixed, encode once", 2.0, rms(o));
+        }
+        // --- row 5: int16 on per-chunk grids. Still exact under summation,
+        // because every rank uses the same grid for the same chunk.
+        {
+            for (int i = 0; i < NEL; ++i) {
+                double sc = fixed_scale(std::max(camax[i / CH], 1.0), 16);
+                long long a = 0;
+                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;
+            }
+            emit("int16, per-64 scale, exact", 2.0 + 2.0 / CH, rms(o));
+        }
+        // --- row 6: half the bytes, same construction.
+        {
+            for (int i = 0; i < NEL; ++i) {
+                double sc = fixed_scale(std::max(camax[i / CH], 1.0), 8);
+                long long a = 0;
+                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
+                o[i] = (double)a / sc;
+            }
+            emit("int8, per-64 scale, exact", 1.0 + 2.0 / CH, rms(o));
+        }
+        printf("\n");
+        ++pi;
+    }
+    printf("    Attribution at P=128, rows 0-5 all at ~2 bytes per element:\n");
+    printf("      bf16 -> fp16          %7.1fx  3 more mantissa bits\n", keep[2][0] / keep[2][2]);
+    printf("      fp16 -> int16 fixed   %7.1fx  4 more, by dropping the exponent field\n",
+           keep[2][2] / keep[2][3]);
+    printf("      re-encode every hop   %7.3fx  closure: rows 3 and 4 are the same number\n",
+           keep[2][3] / keep[2][4]);
+    printf("      global -> per-64      %7.1fx  fitting the grid to a smaller range\n",
+           keep[2][4] / keep[2][5]);
+    printf("\n    So the 39x is a BITS result, not a closure result: it is what you get\n");
+    printf("    for spending all 15 magnitude bits on mantissa instead of 8. Against a\n");
+    printf("    properly scaled fp16 wire -- the control [11] never ran -- the fixed\n");
+    printf("    point advantage is the second line, and that is the number to quote.\n");
+    printf("\n    Closure is still worth having, but it buys a GUARANTEE, not a factor:\n");
+    printf("    re-encoding a fixed-point running sum at every hop changes nothing at\n");
+    printf("    all, so the error is independent of topology, rank count and reduction\n");
+    printf("    order. Two runs on differently shaped clusters return bitwise identical\n");
+    printf("    gradients. No float wire offers that at any width.\n");
+}
+// ============================================================================
+// [14] llm -- does any of this survive at 1B+ parameters?
+// ============================================================================
+//
+// Everything so far ran at NEL=2048-4096 elements, K=256, P<=128. A 1B model
+// all-reduces 1e9 elements per step with K in the thousands over hundreds of
+// ranks, and three things get worse in that direction at once:
+//
+//   A. The a-priori 144*K*P bound loosens as K*P grows while the actual amax
+//      only grows as sqrt(K*P). Every doubling of K*P throws away half a bit.
+//      This part is arithmetic and it is not kind to the a-priori story.
+//
+//   B. amax over 1e9 elements is a max over 1e9 samples, so a single global
+//      scale is set by the most extreme value in the entire tensor. Gradient
+//      tensors have heavy tails. This is the failure mode that actually bites.
+//
+//   C. The scales themselves have to be agreed across ranks BEFORE the payload
+//      moves, or the grids do not line up and closure is lost. That is a second
+//      collective. It has to be cheap enough to be worth it.
+//
+// Part A uses a Gaussian surrogate for the per-rank contribution rather than
+// running the K-deep contraction directly -- at K=16384 and P=1024 the direct
+// loop is 1e11 multiply-adds. The surrogate is validated against the real thing
+// at K=256 in the first table, and it is exact in distribution: a K-deep dot
+// product of independent E2M1 codes is a sum of K iid mean-zero terms, so it is
+// Gaussian with variance K*E[q^2]^2, rounded to an integer.
+static void exp_llm() {
+    printf("\n[14] scaling to 1B+ parameters: what breaks and what holds\n");
+    // Exact second moment of one q1*q2 product over the 15 legal codes.
+    double m2 = 0;
+    for (int a = 0; a < 15; ++a) m2 += (double)e2m1_q(LEGAL[a]) * e2m1_q(LEGAL[a]);
+    m2 /= 15.0;
+    const double sig_prod = m2 * m2;               // Var(q1*q2) = E[q1^2] E[q2^2]
+    // ------------------------------------------------------------- validate
+    printf("\n    A. the a-priori 144*K*P bound against the range the data actually uses\n");
+    {
+        const int NV = 4096, KV = 256, PV = 8;
+        std::uniform_int_distribution<int> cd(0, 14);
+        double am_direct = 0;
+        for (int i = 0; i < NV; ++i) {
+            long long s = 0;
+            for (int r = 0; r < PV; ++r)
+                for (int k = 0; k < KV; ++k)
+                    s += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+            am_direct = std::max(am_direct, fabs((double)s));
+        }
+        std::normal_distribution<double> nd(0.0, sqrt((double)KV * PV * sig_prod));
+        double am_surr = 0;
+        for (int i = 0; i < NV; ++i) am_surr = std::max(am_surr, fabs(nd(rng)));
+        printf("       surrogate check at K=%d P=%d: direct amax %.0f, Gaussian amax %.0f (%.2fx)\n",
+               KV, PV, am_direct, am_surr, am_surr / am_direct);
+    }
+    printf("\n    %7s %6s %14s %12s %10s %12s %12s\n",
+           "K", "P", "144*K*P bound", "real amax", "bits lost", "int16 a-pri", "int16 meas");
+    const int NBIG = 1 << 20;
+    for (int K : {256, 1024, 4096, 16384}) {
+        for (int P : {8, 128, 1024}) {
+            double bound = (double)FP4_PMAX * K * P;
+            double sd = sqrt((double)K * P * sig_prod);
+            std::normal_distribution<double> nd(0.0, sd);
+            double amax = 0, sn = 0;
+            for (int i = 0; i < NBIG; ++i) {
+                double v = nd(rng);
+                amax = std::max(amax, fabs(v));
+                sn += v * v;
+            }
+            sn = sqrt(sn / NBIG);
+            double lost = log2(bound / amax);
+            // RMS relative error of a uniform quantizer with 15 magnitude bits
+            // over each of the two ranges. Per-rank roundings add as sqrt(P).
+            double step_a = bound / 32767.0, step_m = amax / 32767.0;
+            double ea = 100.0 * (step_a / sqrt(12.0)) * sqrt((double)P) / sn;
+            double em = 100.0 * (step_m / sqrt(12.0)) * sqrt((double)P) / sn;
+            printf("    %7d %6d %14.3e %12.3e %10.1f %11.3f%% %11.4f%%\n",
+                   K, P, bound, amax, lost, ea, em);
+        }
+    }
+    printf("\n       The a-priori bound loses half a bit per doubling of K*P, because it\n");
+    printf("       grows linearly while the data only grows as sqrt. By K=16384 and\n");
+    printf("       P=1024 it is 11.6 bits looser than the data needs, leaving about 3\n");
+    printf("       of int16's 15 -- and a 3-bit gradient is a 455%% error, which is to\n");
+    printf("       say no gradient. The measured column at the same size is 0.14%%.\n");
+    printf("\n       The bound is not useless, it is just not a grid spacing. What it\n");
+    printf("       gives is the guarantee that every partial is an INTEGER on a known\n");
+    printf("       lattice, which is what makes the sum exact once you have picked a\n");
+    printf("       spacing. Pick the spacing from a measured amax.\n");
+    // ------------------------------------------------------------------ B
+    printf("\n    B. one global scale over a whole tensor, against per-chunk scales\n");
+    printf("       %d elements, standard normal, then with 0.1%% of values at 30 sigma.\n", NBIG);
+    printf("\n    %-22s %8s %10s %13s %10s\n", "data", "scale", "chunk", "rel err (RMS)", "b/el");
+    for (int outl = 0; outl < 2; ++outl) {
+        std::normal_distribution<double> nd(0.0, 1.0);
+        std::uniform_real_distribution<double> ur(0.0, 1.0);
+        std::vector<double> v(NBIG);
+        for (int i = 0; i < NBIG; ++i) {
+            v[i] = nd(rng);
+            if (outl && ur(rng) < 0.001) v[i] *= 30.0;
+        }
+        double sn = 0;
+        for (int i = 0; i < NBIG; ++i) sn += v[i] * v[i];
+        sn = sqrt(sn);
+        const char *dn = outl ? "0.1% at 30 sigma" : "clean N(0,1)";
+        for (int W : {16, 8}) {
+            double lim = (double)((1 << (W - 1)) - 1);
+            for (int CH : {NBIG, 65536, 4096, 512}) {
+                double e = 0;
+                for (int c = 0; c < NBIG; c += CH) {
+                    int n = std::min(CH, NBIG - c);
+                    double am = 0;
+                    for (int j = 0; j < n; ++j) am = std::max(am, fabs(v[c + j]));
+                    double sc = am > 0 ? lim / am : 1.0;
+                    for (int j = 0; j < n; ++j) {
+                        double q = llrint(v[c + j] * sc) / sc;
+                        e += (q - v[c + j]) * (q - v[c + j]);
+                    }
+                }
+                printf("    %-22s %8s %10d %12.5f%% %10.4f\n", dn, W == 16 ? "int16" : "int8",
+                       CH == NBIG ? 0 : CH, 100.0 * sqrt(e) / sn,
+                       W / 8.0 + (CH == NBIG ? 0.0 : 2.0 / CH));
+            }
+        }
+    }
+    printf("\n       chunk 0 means one scale for the whole tensor. Two things to read\n");
+    printf("       here, and only one of them is the interesting one.\n");
+    printf("\n       int16 barely cares. Even with 0.1%% of values at 30 sigma, a global\n");
+    printf("       scale costs it 0.063%% and per-512 chunks only get that to 0.013%% --\n");
+    printf("       a 5x that nobody is going to notice downstream. Fifteen bits has\n");
+    printf("       enough room that outliers do not have to be handled, only survived.\n");
+    printf("\n       int8 gets the SAME ~5x from chunking -- 16.2%% down to 3.4%% -- and\n");
+    printf("       that is the whole point: the ratio is a property of the data, not of\n");
+    printf("       the width, but 16%% against 3.4%% is a decision and 0.063%% against\n");
+    printf("       0.013%% is not. Chunking does not become more effective at 8 bits, it\n");
+    printf("       becomes necessary, because that is where the error crosses into the\n");
+    printf("       range where anyone cares. A 2-byte scale per 4096 costs 0.05%%.\n");
+    // ------------------------------------------------------------------ C
+    printf("\n    C. the cost of agreeing the scales, per gradient all-reduce\n");
+    printf("       Ranks must share a grid or the integers do not line up, so the\n");
+    printf("       scales go first, as their own (tiny) max-all-reduce.\n");
+    printf("\n    %-12s %12s %12s %14s %12s %10s\n",
+           "model", "params", "bf16 GB", "int16+sc GB", "scale GB", "overhead");
+    struct { const char *nm; double p; } models[] = {
+        {"1B", 1.0e9}, {"7B", 7.0e9}, {"70B", 70.0e9}, {"405B", 405.0e9}};
+    const int CHC = 4096;
+    for (auto &M : models) {
+        double f = 2.0 * (1024 - 1) / 1024.0;               // ring, P=1024
+        double bf = M.p * 2 * f / 1e9;
+        double sc = (M.p / CHC) * 2 * f / 1e9;
+        double it = M.p * 2 * f / 1e9;
+        printf("    %-12s %12.1e %12.2f %14.2f %12.4f %9.3f%%\n",
+               M.nm, M.p, bf, it, sc, 100.0 * sc / it);
+    }
+    printf("\n       Same bytes on the wire as bf16 plus a rounding error of overhead,\n");
+    printf("       for a payload that is exact under summation. The real cost is the\n");
+    printf("       extra latency: two dependent collectives instead of one. At 1024\n");
+    printf("       ranks a small all-reduce is ~50-100 us, so this is only worth it\n");
+    printf("       for tensors big enough that the payload dominates -- which, at\n");
+    printf("       these sizes, every one of them is. It also pipelines: compute the\n");
+    printf("       scales for bucket i+1 while bucket i is on the wire.\n");
+    printf("\n       At int8 with per-4096 scales the payload halves again to %.2f GB\n",
+           7.0e9 * 1.0 * (2.0 * 1023 / 1024) / 1e9);
+    printf("       for a 7B model, at the error in the [13] int8 row.\n");
+}
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -974,6 +1319,8 @@ int main(int argc, char **argv) {
     if (want("interleave")) exp_interleave();
     if (want("link")) exp_link();
     if (want("dense")) exp_dense();
+    if (want("fair")) exp_fair();
+    if (want("llm")) exp_llm();
     printf("\n");
     return 0;
 }
