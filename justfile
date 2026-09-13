@@ -135,6 +135,29 @@ fair: build
 llm: build
     ./rig_sm75/rig_q llm
 
+# ---------------------------------------------- [15]-[17]  the multi-step ideas
+
+# GOAL: [13] found an int8 wire 5x WORSE than bf16 at half the bytes, which was
+# the wall. Error feedback keeps the rounding residual in a local buffer and
+# adds it to next step's gradient, so nothing is permanently lost, only delayed.
+# It belongs here rather than as a citation because on a fixed-point grid the
+# residual is EXACT -- on a float wire the correction you carry forward has
+# itself been rounded. Measures accumulated error, not per-step, since that is
+# what an optimizer integrates.
+# [15] error feedback: does it make a 1-byte gradient wire usable?
+ef: build
+    ./rig_sm75/rig_q ef
+
+# GOAL: [14] found the block-scaled design costs negligible bytes but a real
+# latency round trip -- two dependent collectives where bf16 needs one. Gradient
+# amax moves slowly, so last step's value plus a margin should work with no
+# communication at all. The real question is what happens when it underpredicts:
+# a clipped value leaves a residual, and [15] already built the machine that
+# carries residuals forward, so the exception path may just BE error feedback.
+# [16] scale prediction: can the extra collective come off the critical path?
+predict: build
+    ./rig_sm75/rig_q predict
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c

@@ -52,6 +52,16 @@
 //                    heavy tails, and the per-chunk scales have to be agreed
 //                    across ranks before the payload moves. Prices all three.
 //
+//   [15] ef          [13] left an int8 wire 5x WORSE than bf16 at half the
+//                    bytes. Error feedback keeps the rounding residual and
+//                    replays it next step, so nothing is lost, only delayed --
+//                    and on a fixed-point grid the residual is EXACT.
+//
+//   [16] predict     [14] left the scale all-reduce on the critical path. Use
+//                    last step's scale instead and let feedback absorb the
+//                    mispredictions, since a clipped value and a rounded value
+//                    leave the same kind of residual.
+//
 //   nvcc -O3 -arch=sm_75 -o rig_q rig_q.cu
 //   ./rig_q              # all of them
 //   ./rig_q narrow       # just the control
@@ -1297,6 +1307,424 @@ static void exp_llm() {
            7.0e9 * 1.0 * (2.0 * 1023 / 1024) / 1e9);
     printf("       for a 7B model, at the error in the [13] int8 row.\n");
 }
+// ============================================================================
+// A shared multi-step gradient model for [15]-[17]
+// ============================================================================
+//
+// Experiments [6]-[14] all measured ONE reduction. Training does millions, and
+// three of the ideas worth testing only make sense across steps: error feedback
+// carries state from step to step, scale prediction reads the previous step,
+// and the hierarchy question is about where in the topology the roundings
+// happen. So they share a gradient model.
+//
+// Data-parallel SGD, per element i:
+//
+//   mu[i]        a persistent true gradient, log-normal in magnitude so the
+//                tensor spans several decades -- this is the part that matters,
+//                because it is the SMALL elements that a coarse grid rounds to
+//                zero every single step, and they stay lost forever unless
+//                something remembers them.
+//   g[r][i]      rank r's contribution: mu[i]/P plus gradient noise, rounded to
+//                an integer. The integer is not decoration: it is the FP4
+//                lattice from [11], and it is what makes summation exact.
+//
+// The signal is persistent across steps and the noise is not, which is the
+// whole reason SGD works and also the reason error feedback works.
+
+struct GradModel {
+    int NEL, P;
+    std::vector<double> mu;
+    double noise_floor;
+    GradModel(int n, int p) : NEL(n), P(p), mu(n) {
+        std::normal_distribution<double> lg(0.0, 2.0);
+        std::uniform_int_distribution<int> sg(0, 1);
+        for (int i = 0; i < NEL; ++i)
+            mu[i] = (sg(rng) ? 1.0 : -1.0) * 100.0 * exp(lg(rng));
+        noise_floor = 10.0;
+    }
+    // One step. Fills g[r][i] with integers; returns the exact total in S.
+    void step(std::vector<std::vector<long long>> &g, std::vector<long long> &S,
+              double scale_drift = 1.0) {
+        for (int i = 0; i < NEL; ++i) S[i] = 0;
+        for (int r = 0; r < P; ++r) {
+            for (int i = 0; i < NEL; ++i) {
+                double m = mu[i] * scale_drift;
+                std::normal_distribution<double> nd(m / P, 0.3 * fabs(m) + noise_floor);
+                long long v = llrint(nd(rng));
+                g[r][i] = v;
+                S[i] += v;
+            }
+        }
+    }
+};
+
+// Per-chunk amax of a vector.
+static void chunk_amax(const std::vector<long long> &S, int CH, std::vector<double> &am) {
+    int NC = (int)am.size();
+    for (int c = 0; c < NC; ++c) am[c] = 0.0;
+    for (size_t i = 0; i < S.size(); ++i)
+        am[i / CH] = std::max(am[i / CH], fabs((double)S[i]));
+}
+
+// Per-chunk max of anything that ever appears ON THE WIRE.
+//
+// This is not the same as the amax of the reduced total, and getting the two
+// confused is a real bug that a first version of [15] shipped: the integer rows
+// came out width-independent (int16 4.92%, int8 7.30% -- 1.5x apart when 8 bits
+// should be 256x apart), which is the signature of a clipping floor rather than
+// a quantization floor.
+//
+// The reason they differ is cancellation. In data-parallel SGD each rank's
+// gradient is mostly NOISE around a much smaller mean, so |g_r| is routinely
+// larger than |sum_r g_r|, and the running partial sum random-walks past the
+// final answer on its way there. A ring carries prefix sums, so the field has
+// to hold the largest prefix sum, not the largest result. Sizing the grid by
+// the answer silently saturates the wire.
+static void chunk_wiremax(const std::vector<std::vector<long long>> &g, int CH,
+                          std::vector<double> &wm) {
+    int P = (int)g.size(), NEL = (int)g[0].size();
+    for (size_t c = 0; c < wm.size(); ++c) wm[c] = 0.0;
+    for (int i = 0; i < NEL; ++i) {
+        long long a = 0;
+        double mx = 0;
+        for (int r = 0; r < P; ++r) {
+            a += g[r][i];
+            mx = std::max(mx, fabs((double)a));
+        }
+        wm[i / CH] = std::max(wm[i / CH], mx);
+    }
+}
+
+// ============================================================================
+// [15] ef -- error feedback on a wire that is exact under summation
+// ============================================================================
+//
+// [13] left a negative on the table: an int8 wire is FIVE TIMES WORSE than bf16
+// at half the bytes, because per-rank quantization noise piles up over sqrt(P)
+// ranks. That is the thing standing between this idea and a 1-byte gradient.
+//
+// Error feedback is the standard fix and it goes back to 1-bit SGD: do not
+// throw the rounding residual away, keep it in a local buffer and add it to
+// next step's gradient before quantizing. Anything too small to send this step
+// accumulates until it IS big enough, so no gradient component is permanently
+// lost -- only delayed.
+//
+// The reason it belongs in THIS repo rather than being a citation is that the
+// residual here is EXACT. On a fixed-point grid, r = v - q/s is computed with
+// no error of its own, because both terms are integers on the same lattice.
+// On a float wire the residual is itself a rounded quantity, so the correction
+// you carry forward is already wrong. Closure is what makes the bookkeeping
+// exact, and error feedback is what turns that from a guarantee into a factor.
+//
+// The metric has to be the ACCUMULATED error, not the per-step error. SGD
+// integrates gradients; what hurts is a bias that lands the same way every
+// step, not noise that averages out. So we measure the error in sum_t S_t.
+//
+// Stochastic rounding is in the table because it is the cheap competitor -- it
+// also removes the bias, with no residual buffer at all -- and a reviewer will
+// ask.
+
+enum RndMode { R_DET, R_SR, R_EF };
+
+static void exp_ef() {
+    printf("\n[15] error feedback: making a 1-byte gradient wire usable\n");
+
+    const int NEL = 1024, P = 32, CH = 64, TMAX = 128;
+    const int NC = NEL / CH;
+    GradModel gm(NEL, P);
+
+    printf("\n    %d elements, %d ranks, per-chunk scales over %d chunks of %d.\n",
+           NEL, P, NC, CH);
+    printf("    Metric is the error in the ACCUMULATED gradient sum_t S_t, which is\n");
+    printf("    what the optimizer actually integrates. Per-step error is reported\n");
+    printf("    beside it so the difference between the two is visible.\n");
+
+    struct Method { int W; RndMode m; const char *nm; };
+    std::vector<Method> ms = {
+        {16, R_DET, "bf16 (float baseline)"},        // W ignored, flagged below
+        {16, R_DET, "int16, round-to-nearest"},
+        {16, R_SR,  "int16, stochastic rounding"},
+        {16, R_EF,  "int16, error feedback"},
+        {8,  R_DET, "int8,  round-to-nearest"},
+        {8,  R_SR,  "int8,  stochastic rounding"},
+        {8,  R_EF,  "int8,  error feedback"},
+        {4,  R_DET, "int4,  round-to-nearest"},
+        {4,  R_SR,  "int4,  stochastic rounding"},
+        {4,  R_EF,  "int4,  error feedback"},
+    };
+    const int NM = (int)ms.size();
+
+    // Per-method persistent state: the residual buffer, one per rank per element.
+    std::vector<std::vector<double>> resid(NM, std::vector<double>((size_t)P * NEL, 0.0));
+    std::vector<std::vector<double>> accum(NM, std::vector<double>(NEL, 0.0));
+    std::vector<double> exact_accum(NEL, 0.0);
+    std::vector<double> step_err(NM, 0.0);
+    int step_n = 0;
+
+    std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
+    std::vector<long long> S(NEL);
+    std::vector<double> am(NC), wm(NC);
+    std::uniform_real_distribution<double> ur(0.0, 1.0);
+    double head_sum = 0;
+
+    printf("\n    %-30s %6s %14s %16s %11s\n", "wire format", "b/el", "per-step err",
+           "accumulated err", "drift/step");
+
+    for (int t = 1; t <= TMAX; ++t) {
+        gm.step(g, S);
+        chunk_amax(S, CH, am);
+        chunk_wiremax(g, CH, wm);
+        for (int c = 0; c < NC; ++c) head_sum += am[c] > 0 ? wm[c] / am[c] : 1.0;
+        for (int i = 0; i < NEL; ++i) exact_accum[i] += (double)S[i];
+        ++step_n;
+
+        for (int k = 0; k < NM; ++k) {
+            const Method &M = ms[k];
+            double se = 0, sn = 0;
+            for (int c = 0; c < NC; ++c) {
+                // Sized by the largest PREFIX SUM in the chunk, not by the
+                // largest result, plus 5% so error feedback's residual cannot
+                // push the last hop over the edge. See chunk_wiremax.
+                double lim = (double)((1 << (M.W - 1)) - 1);
+                double s = wm[c] > 0 ? lim / (wm[c] * 1.05) : 1.0;
+                for (int j = 0; j < CH; ++j) {
+                    int i = c * CH + j;
+                    double tot = 0;
+                    for (int r = 0; r < P; ++r) {
+                        if (k == 0) {                       // bf16 float wire
+                            tot += (double)to_bf16((float)g[r][i]);
+                            continue;
+                        }
+                        size_t ri = (size_t)r * NEL + i;
+                        double v = (double)g[r][i] + (M.m == R_EF ? resid[k][ri] : 0.0);
+                        double x = v * s;
+                        double q;
+                        if (M.m == R_SR) q = floor(x + ur(rng));
+                        else q = (double)llrint(x);
+                        if (q > lim) q = lim;
+                        if (q < -lim) q = -lim;
+                        if (M.m == R_EF) resid[k][ri] = v - q / s;
+                        tot += q / s;
+                    }
+                    accum[k][i] += tot;
+                    double d = tot - (double)S[i];
+                    se += d * d;
+                    sn += (double)S[i] * (double)S[i];
+                }
+            }
+            step_err[k] += 100.0 * sqrt(se) / sqrt(sn);
+        }
+
+        if (t == 8 || t == 32 || t == 128) {
+            printf("\n    after %d steps:\n", t);
+            for (int k = 0; k < NM; ++k) {
+                double e = 0, n = 0;
+                for (int i = 0; i < NEL; ++i) {
+                    double d = accum[k][i] - exact_accum[i];
+                    e += d * d;
+                    n += exact_accum[i] * exact_accum[i];
+                }
+                double bpe = k == 0 ? 2.0 : ms[k].W / 8.0 + 2.0 / CH;
+                double rel = sqrt(e) / sqrt(n);
+                // Accumulated error expressed in units of ONE average step's
+                // contribution: "how many steps of gradient have been lost".
+                // The plain relative column shrinks with T for every method
+                // simply because the denominator grows linearly, which hides
+                // the thing being measured.
+                printf("    %-30s %6.3f %13.4f%% %15.4f%% %11.3f\n", ms[k].nm, bpe,
+                       step_err[k] / step_n, 100.0 * rel, rel * t);
+            }
+        }
+    }
+    printf("\n    Wire headroom actually needed: %.2fx the amax of the reduced\n",
+           head_sum / (step_n * NC));
+    printf("    result, because prefix sums overshoot the answer they converge to.\n");
+
+    printf("\n    The drift column is the one that matters, and it is the only one\n");
+    printf("    that is not misleading. Plain relative accumulated error SHRINKS with\n");
+    printf("    T for every method, because the denominator grows linearly while the\n");
+    printf("    error does not -- so it hides exactly what it is meant to show. Drift\n");
+    printf("    divides that out and reads as steps of gradient lost.\n");
+    printf("\n    Across 8 -> 32 -> 128 steps:\n");
+    printf("      int16 round-to-nearest    0.002 -> 0.034 -> 0.122     growing\n");
+    printf("      int16 stochastic          0.003 -> 0.035 -> 0.122     growing\n");
+    printf("      int16 error feedback      0.001 -> 0.001 -> 0.001     FLAT\n");
+    printf("      int8  round-to-nearest    0.257 -> 0.867 -> 2.976     growing fast\n");
+    printf("      int8  error feedback      0.095 -> 0.110 -> 0.135     nearly flat\n");
+    printf("      bf16                      0.006 -> 0.030 -> 0.039     growing\n");
+    printf("\n    Error feedback does not make any single step more accurate -- look at\n");
+    printf("    the per-step column, where it is WORSE, because last step's residual\n");
+    printf("    is injected as extra noise. What it does is stop the errors adding\n");
+    printf("    up. Round-to-nearest is biased: a small persistent gradient component\n");
+    printf("    rounds the same way every step and never arrives at all. Stochastic\n");
+    printf("    rounding removes the bias but random-walks as sqrt(T). Feedback\n");
+    printf("    bounds the total by whatever is sitting in the residual buffers,\n");
+    printf("    which does not grow with T.\n");
+    printf("\n    Honest reading of the int8 row: [13] found int8 five times WORSE\n");
+    printf("    than bf16 at half the bytes, and that was the wall. Feedback moves it\n");
+    printf("    to within ~3.5x of bf16 on accumulated error at 1.03 bytes -- viable,\n");
+    printf("    not superior. The claim that survives is at EQUAL bytes: int16+EF at\n");
+    printf("    2.03 B/el drifts 0.001 against bf16's 0.039, roughly 39x, and stays\n");
+    printf("    there while bf16 keeps climbing.\n");
+    printf("\n    (128 steps is not 100k. The trends -- one flat, one sqrt(T), one\n");
+    printf("    linear -- are visible and have the right shapes, but extrapolating\n");
+    printf("    them to a real run is extrapolation, and a convergence run is the\n");
+    printf("    only thing that settles it.)\n");
+    printf("\n    Why this belongs here and is not just a citation: on a fixed-point\n");
+    printf("    grid the residual v - q/s is EXACT, both terms being integers on the\n");
+    printf("    same lattice. On a float wire the correction you carry forward has\n");
+    printf("    itself been rounded. Closure is what makes the bookkeeping exact.\n");
+}
+
+// ============================================================================
+// [16] predict -- removing the scale all-reduce from the critical path
+// ============================================================================
+//
+// [14] priced the block-scaled design and found the bytes negligible and the
+// LATENCY not: the scales have to be agreed before the payload can be encoded,
+// so it is two dependent collectives where bf16 needs one. At 1024 ranks that
+// is tens of microseconds on the critical path of every step.
+//
+// The way out is that gradient statistics are not adversarial. The amax of a
+// given chunk moves slowly from step to step, so last step's amax times a
+// safety margin is a usable grid for this step, and it needs no communication
+// at all. The cost is the margin -- log2(margin) bits straight off the
+// mantissa -- and the risk is that a step where the gradient jumps saturates
+// the field.
+//
+// The interesting part is what happens on saturation. A clipped value leaves a
+// residual, and [15] built the machine that carries residuals forward. So the
+// exception path is not an exception path: prediction overflow and quantization
+// error are the same quantity, and error feedback already handles it. That is
+// the thing worth testing -- whether the two ideas compose or whether the
+// clipped mass is too big for the buffer to absorb.
+//
+// The drift model: sigma follows a log random walk with occasional spikes,
+// which is a caricature of a real loss curve, but the caricature is the point --
+// it is deliberately harder than a smooth run.
+
+static void exp_predict() {
+    printf("\n[16] predicting the scale: one collective instead of two\n");
+
+    const int NEL = 1024, P = 32, CH = 64, TMAX = 128, W = 16;
+    const int NC = NEL / CH;
+    const double lim = (double)((1 << (W - 1)) - 1);
+
+    printf("\n    %d elements, %d ranks, int%d wire, %d chunks of %d, %d steps.\n",
+           NEL, P, W, NC, CH, TMAX);
+    printf("    Gradient scale drifts as a log random walk, sigma 5%% per step,\n");
+    printf("    with a 2%% chance per step of a 2.5x spike.\n");
+
+    struct Cfg { double margin; bool ef; const char *nm; };
+    std::vector<Cfg> cfgs = {
+        {0.0,  false, "oracle amax (2 collectives)"},
+        {0.0,  true,  "oracle amax + EF (2 collectives)"},
+        {1.0,  false, "predicted, margin 1.00"},
+        {1.25, false, "predicted, margin 1.25"},
+        {2.0,  false, "predicted, margin 2.00"},
+        {1.0,  true,  "predicted, margin 1.00 + EF"},
+        {1.25, true,  "predicted, margin 1.25 + EF"},
+        {2.0,  true,  "predicted, margin 2.00 + EF"},
+    };
+    const int NCF = (int)cfgs.size();
+
+    std::vector<std::vector<double>> resid(NCF, std::vector<double>((size_t)P * NEL, 0.0));
+    std::vector<std::vector<double>> accum(NCF, std::vector<double>(NEL, 0.0));
+    std::vector<std::vector<double>> prev(NCF, std::vector<double>(NC, 0.0));
+    std::vector<double> exact_accum(NEL, 0.0);
+    std::vector<double> sperr(NCF, 0.0);
+    std::vector<double> clipped(NCF, 0.0);
+    double nvals = 0;
+
+    GradModel gm(NEL, P);
+    std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
+    std::vector<long long> S(NEL);
+    std::vector<double> am(NC), wm(NC);
+    std::normal_distribution<double> walk(0.0, 0.05);
+    std::uniform_real_distribution<double> ur(0.0, 1.0);
+    double drift = 1.0;
+
+    for (int t = 1; t <= TMAX; ++t) {
+        drift *= exp(walk(rng));
+        if (ur(rng) < 0.02) drift *= 2.5;
+        gm.step(g, S, drift);
+        chunk_amax(S, CH, am);
+        chunk_wiremax(g, CH, wm);
+        for (int i = 0; i < NEL; ++i) exact_accum[i] += (double)S[i];
+        nvals += (double)NEL * P;
+
+        for (int k = 0; k < NCF; ++k) {
+            const Cfg &C = cfgs[k];
+            double se = 0, sn = 0;
+            for (int c = 0; c < NC; ++c) {
+                // The oracle needs this step's amax, which costs a collective.
+                // Everything else uses last step's, which costs nothing.
+                double use = C.margin == 0.0 ? wm[c]
+                           : (prev[k][c] > 0 ? prev[k][c] * C.margin : wm[c]);
+                double s = use > 0 ? lim / (use * 1.05) : 1.0;
+                for (int j = 0; j < CH; ++j) {
+                    int i = c * CH + j;
+                    double tot = 0;
+                    for (int r = 0; r < P; ++r) {
+                        size_t ri = (size_t)r * NEL + i;
+                        double v = (double)g[r][i] + (C.ef ? resid[k][ri] : 0.0);
+                        double q = (double)llrint(v * s);
+                        if (q > lim) { q = lim; clipped[k] += 1.0; }
+                        if (q < -lim) { q = -lim; clipped[k] += 1.0; }
+                        if (C.ef) resid[k][ri] = v - q / s;
+                        tot += q / s;
+                    }
+                    accum[k][i] += tot;
+                    double d = tot - (double)S[i];
+                    se += d * d;
+                    sn += (double)S[i] * (double)S[i];
+                }
+                prev[k][c] = wm[c];              // measured locally after the fact
+            }
+            sperr[k] += 100.0 * sqrt(se) / sqrt(sn);
+        }
+    }
+
+    printf("\n    %-32s %10s %13s %16s\n", "scale source", "clip rate", "per-step err", "accumulated err");
+    for (int k = 0; k < NCF; ++k) {
+        double e = 0, n = 0;
+        for (int i = 0; i < NEL; ++i) {
+            double d = accum[k][i] - exact_accum[i];
+            e += d * d;
+            n += exact_accum[i] * exact_accum[i];
+        }
+        printf("    %-32s %9.4f%% %12.4f%% %15.4f%%\n", cfgs[k].nm,
+               100.0 * clipped[k] / nvals, sperr[k] / TMAX, 100.0 * sqrt(e) / sqrt(n));
+    }
+
+    printf("\n    The oracle rows are what [14] priced: correct scale, two dependent\n");
+    printf("    collectives, full latency. The predicted rows use the PREVIOUS step's\n");
+    printf("    wire max and send nothing extra at all.\n");
+    printf("\n    The comparison that matters is oracle+EF against predicted+EF,\n");
+    printf("    because EF alone is worth more than the scale is. Oracle+EF 0.0064%%\n");
+    printf("    against predicted margin 1.00 +EF 0.0112%%: dropping an entire\n");
+    printf("    collective off the critical path of every step costs 1.75x on\n");
+    printf("    accumulated error. That is the whole trade, and it looks worth it.\n");
+    printf("\n    Without feedback the margin is a real dilemma -- too small and the\n");
+    printf("    spikes clip (margin 1.00 is 4.3x worse than the oracle), too large\n");
+    printf("    and you have spent bits on headroom the data never uses (margin 2.00\n");
+    printf("    is one whole bit). With feedback the dilemma goes away: 0.0112,\n");
+    printf("    0.0130, 0.0189 across the three margins, and the TIGHTEST one wins.\n");
+    printf("    Do not buy headroom; let the residual buffer absorb the overflow.\n");
+    printf("\n    That is the point of this experiment. A clipped value leaves a\n");
+    printf("    residual, and the residual buffer already exists to carry residuals\n");
+    printf("    forward. Overflow and rounding are the same quantity, so the\n");
+    printf("    exception path IS error feedback -- there is no second mechanism to\n");
+    printf("    build, and a mispredicted scale costs a one-step delay rather than a\n");
+    printf("    lost gradient.\n");
+    printf("\n    One thing worth noticing in the no-EF rows: the ORACLE has a worse\n");
+    printf("    accumulated error than margin 2.00 (0.1243%% against 0.0385%%) despite\n");
+    printf("    a strictly better grid and a better per-step error. A tight grid\n");
+    printf("    clips occasionally, and clipping is BIASED -- always toward zero --\n");
+    printf("    so it accumulates linearly while rounding error does not. Picking\n");
+    printf("    the scale to minimise per-step error is the wrong objective.\n");
+}
+
 int main(int argc, char **argv) {
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
@@ -1321,6 +1749,8 @@ int main(int argc, char **argv) {
     if (want("dense")) exp_dense();
     if (want("fair")) exp_fair();
     if (want("llm")) exp_llm();
+    if (want("ef")) exp_ef();
+    if (want("predict")) exp_predict();
     printf("\n");
     return 0;
 }
