@@ -158,6 +158,16 @@ ef: build
 predict: build
     ./rig_sm75/rig_q predict
 
+# GOAL: every experiment so far treated the ranks as one flat ring. Real
+# clusters are 8 GPUs on NVLink inside a node and ~10x slower between nodes.
+# Two questions: does quantizing once at the source make a hierarchy return
+# BIT-IDENTICAL results to a flat ring (closure says it must), and is the
+# sqrt(L) accuracy from quantizing per-node instead of per-rank worth the
+# intra-node bandwidth it costs? The time model answers the second one no.
+# [17] hierarchical reduction: where the roundings go, and what they cost
+tiers: build
+    ./rig_sm75/rig_q tiers
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
