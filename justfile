@@ -168,6 +168,16 @@ predict: build
 tiers: build
     ./rig_sm75/rig_q tiers
 
+# GOAL: everything from [11] to [17] assumes an all-REDUCE, where P values are
+# summed on the wire. MoE is dominated by all-to-ALL, which sums nothing in
+# flight. Tests which of the three ideas survive: the bits argument (it does),
+# closure (it does not -- its value scales with additions on the wire, and an
+# a2a has zero), and error feedback (only after re-deriving it around the index
+# the router cannot move, which is the expert channel and not the token slot).
+# [18] MoE all-to-all: which parts of the wire story actually transfer?
+moe: build
+    ./rig_sm75/rig_q moe
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
