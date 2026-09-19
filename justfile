@@ -178,6 +178,16 @@ tiers: build
 moe: build
     ./rig_sm75/rig_q moe
 
+# GOAL: can a value stay an INTEGER from GEMM output through split-K and across
+# the wire, with no dequantize anywhere? MXFP4's power-of-two scale makes it
+# possible (a shift, not a multiply) where NVFP4's E4M3 scale does not -- which
+# puts this in direct conflict with the recommendation in [8]. Also finds where
+# fp32 accumulation stops being exact, which turns out to be outside the
+# operating range, making the on-GPU half of this a negative result.
+# [19] end-to-end integral: GEMM -> split-K -> wire, no float in between
+chain: build
+    ./rig_sm75/rig_q chain
+
 # Host-only exhaustive check of the FP4 table, no GPU needed
 test-unpack:
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
