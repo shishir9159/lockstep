@@ -1,85 +1,26 @@
-// rig_q -- quantization and transport experiments, sm_75 and up.
+// rig_q -- quantization and transport experiments [6]-[19], sm_75 and up.
 //
-// rig.cu asked whether the bit-packing idea works. The answer was: not as an
-// accumulation format, yes as a transport format. This file asks the follow-on
-// questions, and every one of them exists because a previous claim in this repo
-// did not survive its own control.
+// This file prints tables; ../FINDINGS.md interprets them. Every experiment
+// reseeds the RNG, so one experiment run alone prints the same numbers it
+// prints inside the full suite.
 //
-//   [6]  narrow      Is the split-K win PACKING or just NARROWING? Experiment
-//                    [5] compared int32x2 against a packed int16 pair, which is
-//                    8 bytes against 4. Two separate int16 arrays are also 4.
-//                    If that third row ties the packed one, the result is "FP4
-//                    lets you store 16-bit partials exactly" and the pairing is
-//                    a rounding error. This is the control [5] was missing.
+//   [6]  narrow      split-K partials: is the win packing or narrowing?
+//   [7]  int8acc     INT8/s32: is the accumulator or the operand the wall?
+//   [8]  nvfp4       MXFP4 vs NVFP4, accuracy per bit
+//   [9]  mxfp8       what 4-bit buys over MXFP8/BF16 at equal FLOPs
+//   [10] interleave  one nibble-interleaved stream for two microbatches
+//   [11] link        measured off-chip bandwidth + all-reduce roofline
+//   [12] dense       normalization-aware packing of partials
+//   [13] fair        all-reduce at equal bytes: closure vs bits, ring vs direct
+//   [14] llm         a-priori bound, outliers and scale agreement at 1B-405B
+//   [15] ef          error feedback over many steps
+//   [16] predict     last step's scale instead of a scale collective
+//   [17] tiers       two-level (NVLink + IB) reduction: numerics and time
+//   [18] moe         all-to-all: which of the ideas transfer
+//   [19] chain       keeping partials integral from GEMM to wire
 //
-//   [7]  int8acc     INT8/s32 is the only Hopper datapath whose accumulator is
-//                    wide enough for a packed dual dot product (32 bits against
-//                    fp32's 24 and the FP8 path's ~14). Does the scheme survive
-//                    there? Separates the accumulator question from the operand
-//                    question so we learn which one actually kills it.
-//
-//   [8]  nvfp4       MXFP4 (block 32, E8M0 scale) against NVFP4 (block 16,
-//                    E4M3 scale). Accuracy per bit, on clean and outlier data.
-//
-//   [9]  mxfp8       MXFP4 against MXFP8. On Hopper both run at the same FLOP
-//                    rate, because MXFP4 is emulated onto the FP8 datapath. So
-//                    what does the 4-bit format actually buy?
-//
-//   [10] interleave  Nibble-interleave A1 and A2 into one byte so a single load
-//                    stream serves both microbatches. Identical byte count --
-//                    this is a locality test, not a bandwidth test, and it is
-//                    labelled that way so nobody reports it as the latter.
-//
-//   [11] link        The reason for all of this: inter-GPU reduction. Measures
-//                    real off-chip bandwidth here, then simulates a P-rank ring
-//                    all-reduce in bf16, fp8, and fixed-point int16 with the
-//                    a-priori 144*d bound. NOTE: its headline 39x is correct
-//                    as a number and wrong as an explanation -- see [13].
-//
-//   [12] dense       Normalization-aware packing. If the result gets normalized
-//                    after the reduction anyway, partials do not need to be
-//                    exactly recoverable -- they need to be good enough after
-//                    the sum. How dense can we go, and what does the a-priori
-//                    bound cost us against the measured range?
-//
-//   [13] fair        The control for [11]. Its 39x was attributed to
-//                    associativity, but its own numbers say otherwise. Splits
-//                    the gap into bits-per-element and closure-under-addition,
-//                    against a properly scaled fp16 wire rather than raw bf16.
-//
-//   [14] llm         Does any of it survive at 1B+ parameters? The a-priori
-//                    bound loosens as sqrt(K*P), a single global amax dies on
-//                    heavy tails, and the per-chunk scales have to be agreed
-//                    across ranks before the payload moves. Prices all three.
-//
-//   [15] ef          [13] left an int8 wire 5x WORSE than bf16 at half the
-//                    bytes. Error feedback keeps the rounding residual and
-//                    replays it next step, so nothing is lost, only delayed --
-//                    and on a fixed-point grid the residual is EXACT.
-//
-//   [16] predict     [14] left the scale all-reduce on the critical path. Use
-//                    last step's scale instead and let feedback absorb the
-//                    mispredictions, since a clipped value and a rounded value
-//                    leave the same kind of residual.
-//
-//   [17] tiers       Real clusters are not flat rings. Does quantize-once make
-//                    a hierarchy bit-identical to a flat ring, and is per-node
-//                    quantization worth the intra-node bandwidth it costs?
-//                    (Yes, and no -- the time model kills the second one.)
-//
-//   [18] moe         All of [11]-[17] assumes an all-REDUCE. MoE is dominated by
-//                    all-to-ALL, which sums nothing in flight. Which of the
-//                    three ideas transfer? Bits yes, closure no, feedback only
-//                    after re-deriving it around a stable index.
-//
-//   [19] chain       Can a value stay an integer from GEMM output to wire, with
-//                    no dequantize anywhere? MXFP4 allows it and NVFP4 does not,
-//                    which conflicts with [8]. On-GPU it is a negative result:
-//                    fp32 was already exact for realistic workloads.
-//
-//   nvcc -O3 -arch=sm_75 -o rig_q rig_q.cu
-//   ./rig_q              # all fourteen
-//   ./rig_q narrow       # just the control
+//   nvcc -O3 -std=c++17 -arch=sm_75 -o rig_q rig_q.cu
+//   ./rig_q [name]
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -97,6 +38,7 @@ static std::mt19937 rng(20260909);
 struct Timer {
     cudaEvent_t a, b;
     Timer() { cudaEventCreate(&a); cudaEventCreate(&b); }
+    ~Timer() { cudaEventDestroy(a); cudaEventDestroy(b); }
     void start() { cudaEventRecord(a); }
     float stop() {
         cudaEventRecord(b);
@@ -106,19 +48,48 @@ struct Timer {
         return ms;
     }
 };
-// The 15 legal E2M1 codes (code 8 is negative zero, skipped).
+// The 15 E2M1 codes, negative zero (code 8) excluded.
 static const int LEGAL[15] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
-static inline float to_bf16(float x) {
+static inline float to_bf16(float x) {                 // round-to-nearest-even
     union { float f; uint32_t u; } c;
     c.f = x;
     c.u = (c.u + 0x7FFFu + ((c.u >> 16) & 1u)) & 0xFFFF0000u;
     return c.f;
 }
+// fp16's 11-bit significand. Range is not modelled; callers pre-scale.
+static inline float to_fp16(float x) { return round_sig(x, 13); }
 static inline int bits_of(long long v) {
     int n = 0;
     while (v > 0) { v >>= 1; ++n; }
     return n;
 }
+// A depth-d dot product of random FP4 values on the integer grid q = 2*value.
+static long long fp4_dot(int d, std::uniform_int_distribution<int> &cd) {
+    long long a = 0;
+    for (int k = 0; k < d; ++k)
+        a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
+    return a;
+}
+// Running sum carried in a field of +-lim, saturating as a narrow wire would.
+static inline long long sat_add(long long a, long long q, long long lim, long long *sat) {
+    a += q;
+    if (a > lim) { a = lim; ++*sat; }
+    if (a < -lim) { a = -lim; ++*sat; }
+    return a;
+}
+template <class F> static float best_of(F fn, int iters = 20) {
+    Timer tm;
+    fn();
+    CHECK(cudaDeviceSynchronize());
+    float best = 1e30f;
+    for (int r = 0; r < 5; ++r) {
+        tm.start();
+        for (int i = 0; i < iters; ++i) fn();
+        best = std::min(best, tm.stop() / iters);
+    }
+    return best;
+}
+
 // ============================================================================
 // [6] narrow -- packing versus narrowing
 // ============================================================================
@@ -718,30 +689,14 @@ static void exp_interleave() {
     printf("    is no second densification to collect on the operand side.\n");
 }
 // ============================================================================
-// [11] link -- the inter-GPU case, which is the actual reason for all of this
+// [11] link -- measured off-chip bandwidth, and what a byte costs on a link
 // ============================================================================
-//
-// Off-chip is where a saved byte is worth the most. Two halves:
-//
-//   A. measured. Real device-to-host bandwidth on this box at 8 / 4 / 2 bytes
-//      per output pair. PCIe is a slow link, which makes it a good stand-in for
-//      an interconnect rather than a memory bus.
-//
-//   B. simulated. A P-rank ring all-reduce of a wgrad, in four wire formats.
-//      The claim under test: a fixed-point payload derived from the a-priori
-//      144*d bound sums EXACTLY across hops, because integer addition is
-//      associative, while bf16 and fp8 round at every one of the P-1 hops.
-//      The cost is that the a-priori bound is loose -- so we also measure the
-//      normalization-aware variant that spends one scalar all-reduce on the
-//      real amax and gets the bits back.
 static void exp_link() {
-    printf("\n[11] inter-GPU reduction: what a narrow exact payload is worth off-chip\n");
-    // ---------------------------------------------------------------- part A
-    const size_t NOUT = 1u << 22;                       // 4M output pairs
-    printf("\n    A. measured off-chip bandwidth on this box (%zu output pairs)\n", NOUT);
-    void *dbuf;
+    printf("\n[11] off-chip: measured PCIe bandwidth, and an all-reduce roofline\n");
+    const size_t NOUT = 1u << 22;
+    printf("\n    A. device-to-host copies, %zu output pairs\n", NOUT);
+    void *dbuf, *hbuf;
     CHECK(cudaMalloc(&dbuf, NOUT * 8));
-    void *hbuf;
     CHECK(cudaMallocHost(&hbuf, NOUT * 8));
     Timer tm;
     printf("    %-26s %9s %9s %10s\n", "payload", "MB", "ms", "GB/s");
@@ -749,122 +704,26 @@ static void exp_link() {
         {"int32 x2 (unpacked)", 8}, {"int16 x2 / packed", 4}, {"int8 x2 (lossy)", 2}};
     for (auto &e : pl) {
         size_t nb = NOUT * e.bpp;
-        cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost);
-        CHECK(cudaDeviceSynchronize());
+        CHECK(cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost));
         float best = 1e30f;
         for (int r = 0; r < 5; ++r) {
             tm.start();
-            for (int i = 0; i < 5; ++i) cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost);
+            for (int i = 0; i < 5; ++i) CHECK(cudaMemcpy(hbuf, dbuf, nb, cudaMemcpyDeviceToHost));
             best = std::min(best, tm.stop() / 5);
         }
         printf("    %-26s %9.1f %9.3f %10.1f\n", e.nm, nb / 1e6, best, nb / (best * 1e6));
     }
     cudaFree(dbuf); cudaFreeHost(hbuf);
-    // ---------------------------------------------------------------- part B
-    const int NEL = 2048;        // gradient elements
-    const int KLOC = 256;        // per-rank contraction depth
-    const double BOUND = (double)FP4_PMAX * KLOC;        // |g_r| <= 144 * KLOC, a priori
-    printf("\n    B. simulated P-rank ring all-reduce of one wgrad tile\n");
-    printf("       %d elements, each rank contributes a depth-%d FP4 contraction.\n", NEL, KLOC);
-    printf("       a-priori bound |g_r| <= 144*%d = %.0f -- known without looking at data.\n",
-           KLOC, BOUND);
-    printf("\n    %5s  %-30s %6s %13s %13s\n", "P", "wire format", "B/el", "rel err (RMS)", "hop rounding");
-    std::uniform_int_distribution<int> cd(0, 14);
-    for (int P : {8, 32, 128}) {
-        // Each rank's exact integer gradient contribution.
-        std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
-        for (int r = 0; r < P; ++r)
-            for (int i = 0; i < NEL; ++i) {
-                long long a = 0;
-                for (int k = 0; k < KLOC; ++k)
-                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                g[r][i] = a;
-            }
-        std::vector<long long> S(NEL, 0);
-        for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i) S[i] += g[r][i];
-        double sn = 0;
-        for (int i = 0; i < NEL; ++i) sn += (double)S[i] * S[i];
-        sn = sqrt(sn);
-        double amax_tot = 0;
-        for (int i = 0; i < NEL; ++i) amax_tot = std::max(amax_tot, fabs((double)S[i]));
-        auto rms = [&](const std::vector<double> &out) {
-            double e = 0;
-            for (int i = 0; i < NEL; ++i) { double d = out[i] - (double)S[i]; e += d * d; }
-            return 100.0 * sqrt(e) / sn;
-        };
-        // bf16 wire: round at every hop.
-        std::vector<double> o(NEL);
-        for (int i = 0; i < NEL; ++i) {
-            float a = to_bf16((float)g[0][i]);
-            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
-            o[i] = a;
-        }
-        printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P, "bf16", 2.0, rms(o), "every hop");
-        // fp8 e4m3 wire with a per-tensor scale: round at every hop, harder.
-        double gmax = 0;
-        for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i)
-            gmax = std::max(gmax, fabs((double)g[r][i]));
-        double s8 = std::max(gmax, amax_tot) / E4M3_MAX;
-        for (int i = 0; i < NEL; ++i) {
-            float a = quant_e4m3((float)(g[0][i] / s8));
-            for (int r = 1; r < P; ++r) a = quant_e4m3(a + quant_e4m3((float)(g[r][i] / s8)));
-            o[i] = (double)a * s8;
-        }
-        printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P, "fp8 e4m3, per-tensor scale", 1.0, rms(o), "every hop");
-        // int16 fixed point, a-priori bound sized for the worst-case total.
-        {
-            double sc = fixed_scale(BOUND * P, 16);
-            for (int i = 0; i < NEL; ++i) {
-                long long a = 0;
-                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;                   // integer adds: exact
-            }
-            printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P,
-                   "int16 fixed, a-priori bound", 2.0, rms(o), "none");
-        }
-        // int16 fixed point, normalization aware: one scalar all-reduce buys the
-        // real amax of the TOTAL, so the grid is sized to the answer, not the bound.
-        {
-            double sc = fixed_scale(amax_tot, 16);
-            for (int i = 0; i < NEL; ++i) {
-                long long a = 0;
-                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;
-            }
-            printf("    %5d  %-30s %6.1f %12.4f%% %13s\n", P,
-                   "int16 fixed, measured amax", 2.0, rms(o), "none");
-        }
-        printf("\n");
-    }
-    printf("    CORRECTED BY [13]. The 'hop rounding: none' column is true, but the\n");
-    printf("    conclusion originally drawn from it was not. Fixed point does not stay\n");
-    printf("    flat in P: read the int16 column above and it grows as sqrt(P), the\n");
-    printf("    same rate as bf16, because every scheme quantizes each rank's own\n");
-    printf("    contribution before it reaches the wire. The ratio between the two\n");
-    printf("    columns NARROWS with P rather than widening. Run `just fair`.\n");
-    printf("\n    What the gap actually is: bf16 spends 8 of its 15 magnitude bits on\n");
-    printf("    an exponent this data does not use. Against a properly scaled fp16\n");
-    printf("    wire at the same 2 bytes the advantage is ~7x, not ~39x. Closure buys\n");
-    printf("    a guarantee -- reduction-order independence -- not an error factor.\n");
-    printf("\n    The gap between the two int16 rows is the price of the a-priori\n");
-    printf("    bound: 144*K*P is a worst case that random data never approaches, so\n");
-    printf("    sizing the grid to it throws away real bits. One scalar all-reduce of\n");
-    printf("    the true amax gets them back, which is the normalization-aware form.\n");
-    // ---------------------------------------------------------------- part C
-    printf("\n    C. roofline: one all-reduce of a 4096x4096 wgrad, ring, 2(P-1)/P bytes\n");
-    const double NGRAD = 4096.0 * 4096.0;
+    printf("\n    B. one ring all-reduce of a 4096x4096 wgrad, P=128, 2(P-1)/P bytes/el\n");
+    const double NGRAD = 4096.0 * 4096.0, f = 2.0 * 127 / 128.0;
     struct { const char *nm; double gbs; } links[] = {
         {"NVLink 4 (per GPU)", 450.0}, {"IB NDR 400G", 50.0}, {"PCIe 4.0 x16", 25.0}};
-    printf("    %-22s %10s %10s %10s %10s\n", "link", "fp32 ms", "bf16 ms", "int16 ms", "saved");
-    for (auto &L : links) {
-        double f = 2.0 * (128 - 1) / 128.0;
-        double t32 = NGRAD * 4 * f / (L.gbs * 1e9) * 1e3;
-        double t16 = NGRAD * 2 * f / (L.gbs * 1e9) * 1e3;
-        printf("    %-22s %10.3f %10.3f %10.3f %9.2fx\n", L.nm, t32, t16, t16, t32 / t16);
-    }
-    printf("    bf16 and int16 move the same bytes -- the difference between them is\n");
-    printf("    not time, it is that one of them is exact under summation.\n");
+    printf("    %-22s %10s %10s %10s\n", "link", "4 B ms", "2 B ms", "1 B ms");
+    for (auto &L : links)
+        printf("    %-22s %10.3f %10.3f %10.3f\n", L.nm,
+               NGRAD * 4 * f / (L.gbs * 1e6), NGRAD * 2 * f / (L.gbs * 1e6), NGRAD * f / (L.gbs * 1e6));
 }
+
 // ============================================================================
 // [12] dense -- normalization-aware packing
 // ============================================================================
@@ -988,178 +847,158 @@ static void exp_dense() {
 }
 // ============================================================================
 // ============================================================================
-// [13] fair -- where does the 39x actually come from?
+// [13] fair -- all-reduce at equal bytes: what closure and bits are each worth
 // ============================================================================
-//
-// [11] reported int16 fixed point beating bf16 by 39x at 128 ranks and put it
-// down to associativity: integer addition rounds once, floating point rounds at
-// every hop. Reading the table in [11] back, that attribution does not survive.
-// The int16 error goes 0.0080 -> 0.0177 -> 0.0329% across P = 8 -> 32 -> 128,
-// which is sqrt(P), not flat. bf16 goes 0.4234 -> 0.7259 -> 1.2951, very nearly
-// the same rate. The ratio between them NARROWS with P (53x, 41x, 39x) instead
-// of widening. Whatever produces the 39x, it is not a difference in how the
-// error accumulates with rank count.
-//
-// The reason both grow as sqrt(P) is that every scheme quantizes each rank's
-// own contribution before it ever reaches the wire. P independent roundings go
-// in, so P independent roundings come out, associativity or no associativity.
-//
-// So decompose it. Two independent claims are tangled together:
-//
-//   1. BITS. A 16-bit fixed-point field spends all 15 magnitude bits on the
-//      mantissa. bf16 spends 8 of its 15 on an exponent that gradient data,
-//      already scaled to a known range, does not use. That is a static ~7 bit
-//      advantage available to ANY integer wire format, with or without FP4,
-//      and it is not news -- it is why gradient-compression work going back to
-//      1-bit SGD scales into a fixed grid. The honest 2-byte float control is
-//      fp16 (11 mantissa bits), not bf16.
-//
-//   2. CLOSURE. A fixed-point grid is closed under addition: the encoding of a
-//      sum IS the sum of the encodings, exactly, as long as the total stays
-//      inside the field. So re-encoding the running sum at each hop costs
-//      nothing. THIS is the part the FP4 144*d bound underwrites, and the way
-//      to see it is to run one format both ways rather than two formats once.
-//
-// Every row below is re-encoded at every hop, as the payload of a real ring
-// reduce-scatter is. That is the comparison [11] did not run.
+// Two topologies for the reduce-scatter half of an all-reduce:
+//   ring    partial sums travel, so a float re-rounds a growing sum at every
+//           hop and an integer field must be wide enough for every prefix sum.
+//   direct  each contribution travels once to the chunk's owner, which
+//           accumulates wide (fp32 / int32) and re-encodes the total once for
+//           the all-gather. Same bytes as a ring, P-1 messages per rank.
+// Integer grids are per 64-element chunk:
+//   a-priori  144*K*P, needs no statistics
+//   oracle    the largest prefix sum on the ring; not computable in advance
+//   safe      sum over ranks of each rank's local chunk max (one sum-all-reduce);
+//             bounds every prefix sum in any order
+//   direct    max over ranks of the local chunk max (one max-all-reduce)
 static void exp_fair() {
-    printf("\n[13] decomposing the int16-vs-bf16 gap: bits, or closure?\n");
-    const int NEL = 4096;
-    const int KLOC = 256;
-    const int CH = 64;                     // block-scale chunk
+    printf("\n[13] all-reduce at equal bytes: closure, bits, and topology\n");
+    const int NEL = 4096, KLOC = 256, CH = 64, NC = NEL / CH, NROW = 12;
     std::uniform_int_distribution<int> cd(0, 14);
-    printf("\n    %d elements, depth-%d FP4 contraction per rank, ring reduce-scatter.\n", NEL, KLOC);
-    printf("    Every format is re-encoded at every hop, as it would be on a real ring.\n");
-    printf("\n    %5s  %-34s %6s %13s %11s\n", "P", "wire format", "b/el", "rel err (RMS)", "vs bf16");
-    double keep[3][8];
+    printf("    %d elements, depth-%d FP4 contraction per rank, per-%d integer scales.\n",
+           NEL, KLOC, CH);
+    printf("\n    %5s  %-38s %6s %13s\n", "P", "wire", "b/el", "rel err (RMS)");
+    double E[3][NROW];
+    long long sat_ring = 0;
+    int bf_moved = 0, int_moved = 0;
     int pi = 0;
     for (int P : {8, 32, 128}) {
         std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
         for (int r = 0; r < P; ++r)
-            for (int i = 0; i < NEL; ++i) {
-                long long a = 0;
-                for (int k = 0; k < KLOC; ++k)
-                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                g[r][i] = a;
-            }
+            for (int i = 0; i < NEL; ++i) g[r][i] = fp4_dot(KLOC, cd);
         std::vector<long long> S(NEL, 0);
         for (int r = 0; r < P; ++r) for (int i = 0; i < NEL; ++i) S[i] += g[r][i];
-        double sn = 0, amax_tot = 0;
+        double sn = 0, amax = 0, gmax = 0;
+        std::vector<double> lmax(NC, 0), lsum(NC, 0), wmax(NC, 0);
         for (int i = 0; i < NEL; ++i) {
             sn += (double)S[i] * S[i];
-            amax_tot = std::max(amax_tot, fabs((double)S[i]));
+            amax = std::max(amax, fabs((double)S[i]));
+            long long a = 0;
+            for (int r = 0; r < P; ++r) {
+                a += g[r][i];
+                wmax[i / CH] = std::max(wmax[i / CH], std::max(fabs((double)a), fabs((double)g[r][i])));
+                lmax[i / CH] = std::max(lmax[i / CH], fabs((double)g[r][i]));
+                gmax = std::max(gmax, fabs((double)g[r][i]));
+            }
         }
+        for (int c = 0; c < NC; ++c)
+            for (int r = 0; r < P; ++r) {
+                double m = 0;
+                for (int i = c * CH; i < (c + 1) * CH; ++i) m = std::max(m, fabs((double)g[r][i]));
+                lsum[c] += m;
+            }
         sn = sqrt(sn);
         std::vector<double> o(NEL);
-        auto rms = [&](const std::vector<double> &v) {
-            double e = 0;
-            for (int i = 0; i < NEL; ++i) { double d = v[i] - (double)S[i]; e += d * d; }
-            return 100.0 * sqrt(e) / sn;
-        };
-        // Per-chunk amax of the TOTAL. Reachable in practice with one small
-        // max-all-reduce over NEL/CH scalars before the payload moves -- [14]
-        // measures what that costs.
-        std::vector<double> camax(NEL / CH, 0.0);
-        for (int i = 0; i < NEL; ++i)
-            camax[i / CH] = std::max(camax[i / CH], fabs((double)S[i]));
         int row = 0;
-        auto emit = [&](const char *nm, double bpe, double err) {
-            keep[pi][row++] = err;
-            printf("    %5d  %-34s %6.2f %12.4f%% %10.1fx\n", P, nm, bpe, err,
-                   err > 0 ? keep[pi][0] / err : 0.0);
+        auto emit = [&](const char *nm, double bpe) {
+            double e = 0;
+            for (int i = 0; i < NEL; ++i) { double d = o[i] - (double)S[i]; e += d * d; }
+            E[pi][row++] = 100.0 * sqrt(e) / sn;
+            printf("    %5d  %-38s %6.2f %12.4f%%\n", P, nm, bpe, E[pi][row - 1]);
         };
-        // --- row 0: bf16, raw. The [11] baseline, reproduced.
-        for (int i = 0; i < NEL; ++i) {
-            float a = to_bf16((float)g[0][i]);
-            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
-            o[i] = a;
-        }
-        emit("bf16, raw (the [11] baseline)", 2.0, rms(o));
-        // --- row 1: bf16 with a per-tensor scale. Control: a float is scale
-        // invariant, so this MUST match row 0. If it does not, row 0 was a
-        // scaling mistake rather than a format result.
-        for (int i = 0; i < NEL; ++i) {
-            double s = amax_tot;
-            float a = to_bf16((float)(g[0][i] / s));
-            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)(g[r][i] / s)));
-            o[i] = (double)a * s;
-        }
-        emit("bf16, per-tensor scale (control)", 2.0, rms(o));
-        // --- row 2: fp16, per-tensor scale. THE honest 2-byte float: same
-        // bytes, 11 mantissa bits instead of 8, and the scale keeps every value
-        // inside its narrower exponent range so the range never binds.
-        for (int i = 0; i < NEL; ++i) {
-            double s = amax_tot;
-            float a = round_sig((float)(g[0][i] / s), 13);
-            for (int r = 1; r < P; ++r)
-                a = round_sig(a + round_sig((float)(g[r][i] / s), 13), 13);
-            o[i] = (double)a * s;
-        }
-        emit("fp16, per-tensor scale", 2.0, rms(o));
-        // --- row 3: int16 fixed, global scale, RE-ENCODED AT EVERY HOP.
-        {
-            double sc = fixed_scale(amax_tot, 16);
+        // Floats: enc() rounds a pre-scaled value to the wire format.
+        auto float_ring = [&](float (*enc)(float), double s, bool reverse = false) {
             for (int i = 0; i < NEL; ++i) {
-                long long a = llrint((double)g[0][i] * sc);
-                for (int r = 1; r < P; ++r) a = a + (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;
+                float a = 0.f;
+                for (int k = 0; k < P; ++k) {
+                    float q = enc((float)(g[reverse ? P - 1 - k : k][i] / s));
+                    a = k ? enc(a + q) : q;
+                }
+                o[i] = (double)a * s;
             }
-            emit("int16 fixed, re-encode every hop", 2.0, rms(o));
-        }
-        // --- row 4: same grid, encoded ONCE at the source. If closure holds,
-        // this is identical to row 3 -- that is the whole claim, and it is a
-        // claim about the format, not about the data.
-        {
-            double sc = fixed_scale(amax_tot, 16);
+        };
+        auto float_direct = [&](float (*enc)(float), double s_src, double s_tot) {
             for (int i = 0; i < NEL; ++i) {
+                float a = 0.f;                                   // owner's fp32 accumulator
+                for (int r = 0; r < P; ++r) a += enc((float)(g[r][i] / s_src)) * (float)s_src;
+                o[i] = (double)enc((float)(a / s_tot)) * s_tot;
+            }
+        };
+        // Integers: the ring carries the running sum in the W-bit field itself.
+        auto int_ring = [&](int W, const std::vector<double> &ref, std::vector<long long> *tot = nullptr,
+                            bool reverse = false) {
+            const long long lim = (1LL << (W - 1)) - 1;
+            for (int i = 0; i < NEL; ++i) {
+                double s = ref[i / CH] > 0 ? (double)lim / ref[i / CH] : 1.0;
                 long long a = 0;
-                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;
+                for (int k = 0; k < P; ++k) {
+                    long long q = llrint((double)g[reverse ? P - 1 - k : k][i] * s);
+                    a = sat_add(a, std::max(-lim, std::min(lim, q)), lim, &sat_ring);
+                }
+                if (tot) (*tot)[i] = a;
+                o[i] = (double)a / s;
             }
-            emit("int16 fixed, encode once", 2.0, rms(o));
-        }
-        // --- row 5: int16 on per-chunk grids. Still exact under summation,
-        // because every rank uses the same grid for the same chunk.
-        {
-            for (int i = 0; i < NEL; ++i) {
-                double sc = fixed_scale(std::max(camax[i / CH], 1.0), 16);
-                long long a = 0;
-                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;
+        };
+        auto int_direct = [&](int W) {
+            const long long lim = (1LL << (W - 1)) - 1;
+            for (int c = 0; c < NC; ++c) {
+                double s = lmax[c] > 0 ? (double)lim / lmax[c] : 1.0, vmax = 0;
+                for (int i = c * CH; i < (c + 1) * CH; ++i) {
+                    long long a = 0;                             // owner's int32 accumulator
+                    for (int r = 0; r < P; ++r) a += llrint((double)g[r][i] * s);
+                    o[i] = (double)a / s;
+                    vmax = std::max(vmax, fabs(o[i]));
+                }
+                double s2 = vmax > 0 ? (double)lim / vmax : 1.0; // owner-local, sent with the chunk
+                for (int i = c * CH; i < (c + 1) * CH; ++i) o[i] = (double)llrint(o[i] * s2) / s2;
             }
-            emit("int16, per-64 scale, exact", 2.0 + 2.0 / CH, rms(o));
-        }
-        // --- row 6: half the bytes, same construction.
-        {
-            for (int i = 0; i < NEL; ++i) {
-                double sc = fixed_scale(std::max(camax[i / CH], 1.0), 8);
-                long long a = 0;
-                for (int r = 0; r < P; ++r) a += (long long)llrint((double)g[r][i] * sc);
-                o[i] = (double)a / sc;
-            }
-            emit("int8, per-64 scale, exact", 1.0 + 2.0 / CH, rms(o));
+        };
+        const double bpc = 2.0 / CH;                             // one 2-byte scale per chunk
+        float_ring(to_bf16, 1.0);           emit("bf16, ring", 2.0);
+        float_direct(to_bf16, 1.0, 1.0);    emit("bf16, direct", 2.0);
+        float_ring(to_fp16, amax);          emit("fp16, ring", 2.0);
+        float_direct(to_fp16, amax, amax);  emit("fp16, direct", 2.0);
+        std::vector<double> apri(NC, (double)FP4_PMAX * KLOC * P);
+        int_ring(16, apri);                 emit("int16, ring, a-priori 144*K*P grid", 2.0);
+        int_ring(16, wmax);                 emit("int16, ring, oracle grid", 2.0 + bpc);
+        int_ring(16, lsum);                 emit("int16, ring, safe grid", 2.0 + bpc);
+        int_direct(16);                     emit("int16, direct", 2.0 + bpc);
+        const double s8 = std::max(gmax, amax) / E4M3_MAX;
+        float_ring(quant_e4m3, s8);         emit("fp8 e4m3, ring", 1.0);
+        float_direct(quant_e4m3, gmax / E4M3_MAX, amax / E4M3_MAX); emit("fp8 e4m3, direct", 1.0);
+        int_ring(8, wmax);                  emit("int8, ring, oracle grid", 1.0 + bpc);
+        int_direct(8);                      emit("int8, direct", 1.0 + bpc);
+        if (P == 128) {
+            // Reverse the ring. Integers on the safe grid cannot saturate in any
+            // order, so closure says nothing may change; bf16 has no such property.
+            std::vector<double> f0(NEL);
+            float_ring(to_bf16, 1.0);
+            f0 = o;
+            float_ring(to_bf16, 1.0, true);
+            for (int i = 0; i < NEL; ++i) bf_moved += o[i] != f0[i];
+            std::vector<long long> t0(NEL), t1(NEL);
+            int_ring(16, lsum, &t0);
+            int_ring(16, lsum, &t1, true);
+            for (int i = 0; i < NEL; ++i) int_moved += t0[i] != t1[i];
         }
         printf("\n");
         ++pi;
     }
-    printf("    Attribution at P=128, rows 0-5 all at ~2 bytes per element:\n");
-    printf("      bf16 -> fp16          %7.1fx  3 more mantissa bits\n", keep[2][0] / keep[2][2]);
-    printf("      fp16 -> int16 fixed   %7.1fx  4 more, by dropping the exponent field\n",
-           keep[2][2] / keep[2][3]);
-    printf("      re-encode every hop   %7.3fx  closure: rows 3 and 4 are the same number\n",
-           keep[2][3] / keep[2][4]);
-    printf("      global -> per-64      %7.1fx  fitting the grid to a smaller range\n",
-           keep[2][4] / keep[2][5]);
-    printf("\n    So the 39x is a BITS result, not a closure result: it is what you get\n");
-    printf("    for spending all 15 magnitude bits on mantissa instead of 8. Against a\n");
-    printf("    properly scaled fp16 wire -- the control [11] never ran -- the fixed\n");
-    printf("    point advantage is the second line, and that is the number to quote.\n");
-    printf("\n    Closure is still worth having, but it buys a GUARANTEE, not a factor:\n");
-    printf("    re-encoding a fixed-point running sum at every hop changes nothing at\n");
-    printf("    all, so the error is independent of topology, rank count and reduction\n");
-    printf("    order. Two runs on differently shaped clusters return bitwise identical\n");
-    printf("    gradients. No float wire offers that at any width.\n");
+    const double *e = E[2];
+    printf("    at P=128:\n");
+    printf("      closure, bf16        ring/direct %7.2fx\n", e[0] / e[1]);
+    printf("      closure, fp16        ring/direct %7.2fx\n", e[2] / e[3]);
+    printf("      int16 vs fp16, ring              %7.2fx\n", e[2] / e[5]);
+    printf("      int16 vs fp16, direct            %7.2fx\n", e[3] / e[7]);
+    printf("      int16 ring, safe vs oracle grid  %7.2fx  (price of a computable ring grid)\n", e[6] / e[5]);
+    printf("      int16 ring (oracle) vs direct    %7.2fx\n", e[5] / e[7]);
+    printf("    int16 direct across P=8/32/128: %.4f / %.4f / %.4f%%; oracle ring %.4f / %.4f / %.4f%%\n",
+           E[0][7], E[1][7], E[2][7], E[0][5], E[1][5], E[2][5]);
+    printf("    reversing the ring at P=128 changes %d of %d bf16 outputs and %d int16 outputs\n",
+           bf_moved, NEL, int_moved);
+    printf("    saturated hops across all integer ring rows: %lld\n", sat_ring);
 }
+
 // ============================================================================
 // [14] llm -- does any of this survive at 1B+ parameters?
 // ============================================================================
@@ -2630,34 +2469,29 @@ static void exp_chain() {
 }
 
 int main(int argc, char **argv) {
+    struct { const char *name; void (*fn)(); } exps[] = {
+        {"narrow", exp_narrow}, {"int8acc", exp_int8acc}, {"nvfp4", exp_nvfp4},
+        {"mxfp8", exp_mxfp8}, {"interleave", exp_interleave}, {"link", exp_link},
+        {"dense", exp_dense}, {"fair", exp_fair}, {"llm", exp_llm}, {"ef", exp_ef},
+        {"predict", exp_predict}, {"tiers", exp_tiers}, {"moe", exp_moe}, {"chain", exp_chain}};
+    const char *only = argc > 1 ? argv[1] : nullptr;
+    bool known = !only;
+    for (auto &e : exps) known = known || !strcmp(only, e.name);
+    if (!known) {
+        fprintf(stderr, "unknown experiment '%s'; one of:", only);
+        for (auto &e : exps) fprintf(stderr, " %s", e.name);
+        fprintf(stderr, "\n");
+        return 1;
+    }
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
     printf("%s  sm_%d%d  %.1f GiB  %d SMs\n", p.name, p.major, p.minor,
            p.totalGlobalMem / 1073741824.0, p.multiProcessorCount);
-    const char *only = argc > 1 ? argv[1] : nullptr;
-    // Reseed before every experiment. Without this, an experiment's numbers
-    // depend on which experiments ran BEFORE it, so `./rig_q tiers` and
-    // `./rig_q` disagree and neither is quotable. Same seed each time, so a
-    // single experiment reproduces standalone and in the suite.
-    auto want = [&](const char *n) {
-        bool w = !only || !strcmp(only, n);
-        if (w) rng.seed(20260909);
-        return w;
-    };
-    if (want("narrow")) exp_narrow();
-    if (want("int8acc")) exp_int8acc();
-    if (want("nvfp4")) exp_nvfp4();
-    if (want("mxfp8")) exp_mxfp8();
-    if (want("interleave")) exp_interleave();
-    if (want("link")) exp_link();
-    if (want("dense")) exp_dense();
-    if (want("fair")) exp_fair();
-    if (want("llm")) exp_llm();
-    if (want("ef")) exp_ef();
-    if (want("predict")) exp_predict();
-    if (want("tiers")) exp_tiers();
-    if (want("moe")) exp_moe();
-    if (want("chain")) exp_chain();
+    for (auto &e : exps)
+        if (!only || !strcmp(only, e.name)) {
+            rng.seed(20260909);
+            e.fn();
+        }
     printf("\n");
     return 0;
 }
