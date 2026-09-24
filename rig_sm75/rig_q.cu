@@ -1456,255 +1456,122 @@ static void exp_predict() {
 }
 
 // ============================================================================
-// [17] tiers -- put the roundings where the bandwidth is
+// [17] tiers -- two-level reduction: where the roundings go, and what they cost
 // ============================================================================
-//
-// Every experiment so far has treated the P ranks as one flat ring. Real
-// clusters are not flat: 8 GPUs inside a node talk over NVLink at ~450 GB/s,
-// and nodes talk to each other over InfiniBand at ~50 GB/s. Nearly 10x.
-//
-// Hierarchical all-reduce is standard practice for the bandwidth reason alone
-// (reduce-scatter in the node, all-reduce across nodes, all-gather in the
-// node). What is specific to a fixed-point wire is the NUMERICS of doing it
-// that way. Intra-node the payload is small and the link is fast, so the
-// intra-node stage can stay in int32 and be EXACTLY zero-error. Only the
-// inter-node stage needs a narrow wire.
-//
-// That drops the number of quantization events from P to G, the node count.
-// Since per-rank rounding errors add in quadrature, the error should fall by
-// sqrt(L) where L is GPUs per node -- a free 2.8x at L=8 that costs nothing
-// and composes with everything in [15] and [16].
-//
-// A float wire cannot do this. Its intra-node stage rounds too.
-
+// flat = one ring over P ranks. hier = ring inside each node of L GPUs, then a
+// ring across the G nodes. All integer running sums saturate.
 static void exp_tiers() {
-    printf("\n[17] hierarchical reduction: where the roundings go, and what they cost\n");
-
-    const int NEL = 2048, CH = 64;
-    const int NC = NEL / CH;
-
-    printf("\n    %d elements, per-chunk scales, error against an exact integer sum.\n", NEL);
-    printf("    flat = one ring over all P ranks. hier = ring inside the node, then\n");
-    printf("    ring across nodes, then broadcast back -- standard practice.\n");
+    printf("\n[17] hierarchical reduction: numerics, then time\n");
+    const int NEL = 2048, CH = 64, NC = NEL / CH;
     printf("\n    %6s %5s %6s  %-36s %13s %11s\n",
-           "nodes", "gpus", "P", "scheme", "rel err (RMS)", "vs flat");
-
+           "nodes", "gpus", "P", "scheme", "rel err (RMS)", "vs flat bf16");
     struct Shape { int G, L; };
     for (Shape sh : {Shape{16, 8}, Shape{128, 8}}) {
-        int G = sh.G, L = sh.L, P = G * L;
+        const int G = sh.G, L = sh.L, P = G * L;
         GradModel gm(NEL, P);
         std::vector<std::vector<long long>> g(P, std::vector<long long>(NEL));
         std::vector<long long> S(NEL);
-        std::vector<double> am(NC), wm(NC), wmn(NC);
+        std::vector<double> wm(NC), wmn(NC);
         gm.step(g, S);
-        chunk_amax(S, CH, am);
-        chunk_wiremax(g, CH, wm);            // prefix maxima over P ranks
-        double sn = 0;
-        for (int i = 0; i < NEL; ++i) sn += (double)S[i] * (double)S[i];
-        sn = sqrt(sn);
-
-        // Node-level exact partial sums: pure integer addition, no error.
+        chunk_wiremax(g, CH, wm);                           // prefix maxima over P ranks
         std::vector<std::vector<long long>> ng(G, std::vector<long long>(NEL, 0));
         for (int r = 0; r < P; ++r)
             for (int i = 0; i < NEL; ++i) ng[r / L][i] += g[r][i];
-        chunk_wiremax(ng, CH, wmn);          // prefix maxima over G nodes
-
-        double base_f = 0, once_err = -1, flat_err = -1;
-        double maxdiff = 0;
-
-        auto report = [&](const char *nm, double err, double ref) {
-            printf("    %6d %5d %6d  %-36s %12.5f%% %10.2fx\n",
-                   G, L, P, nm, err, ref > 0 ? ref / err : 1.0);
+        chunk_wiremax(ng, CH, wmn);                         // prefix maxima over G nodes
+        double sn = 0;
+        for (int i = 0; i < NEL; ++i) sn += (double)S[i] * (double)S[i];
+        sn = sqrt(sn);
+        double base = 0;
+        long long sat = 0;
+        auto report = [&](const char *nm, const std::vector<double> &out) {
+            double e = 0;
+            for (int i = 0; i < NEL; ++i) { double d = out[i] - (double)S[i]; e += d * d; }
+            e = 100.0 * sqrt(e) / sn;
+            if (base == 0) base = e;
+            printf("    %6d %5d %6d  %-36s %12.5f%% %10.2fx\n", G, L, P, nm, e, base / e);
         };
-
-        // --- 1. flat bf16: a ring over P ranks, rounding at every hop.
-        {
-            double e = 0;
+        std::vector<double> out(NEL);
+        for (int i = 0; i < NEL; ++i) {                     // 1. flat bf16
+            float a = to_bf16((float)g[0][i]);
+            for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
+            out[i] = a;
+        }
+        report("flat bf16", out);
+        for (int i = 0; i < NEL; ++i) {                     // 2. hier bf16
+            float b = 0.f;
+            for (int n = 0; n < G; ++n) {
+                float a = to_bf16((float)g[n * L][i]);
+                for (int l = 1; l < L; ++l) a = to_bf16(a + to_bf16((float)g[n * L + l][i]));
+                b = n ? to_bf16(b + a) : a;
+            }
+            out[i] = b;
+        }
+        report("hier bf16", out);
+        const long long l16 = 32767, l8 = 127;
+        std::vector<long long> t3(NEL), t4(NEL);
+        for (int i = 0; i < NEL; ++i) {                     // 3. flat int16
+            double s = l16 / (wm[i / CH] * 1.05);
+            long long a = 0;
+            for (int r = 0; r < P; ++r) a = sat_add(a, llrint((double)g[r][i] * s), l16, &sat);
+            t3[i] = a;
+            out[i] = a / s;
+        }
+        report("flat int16", out);
+        for (int i = 0; i < NEL; ++i) {                     // 4. hier int16, same source grid
+            double s = l16 / (wm[i / CH] * 1.05);
+            long long b = 0;
+            for (int n = 0; n < G; ++n) {
+                long long a = 0;
+                for (int l = 0; l < L; ++l)
+                    a = sat_add(a, llrint((double)g[n * L + l][i] * s), l16, &sat);
+                b = sat_add(b, a, l16, &sat);
+            }
+            t4[i] = b;
+            out[i] = b / s;
+        }
+        report("hier int16, quantize once at source", out);
+        for (int W : {16, 8}) {                             // 5-6. exact intra, narrow inter
+            const long long lim = W == 16 ? l16 : l8;
             for (int i = 0; i < NEL; ++i) {
-                float a = to_bf16((float)g[0][i]);
-                for (int r = 1; r < P; ++r) a = to_bf16(a + to_bf16((float)g[r][i]));
-                double d = (double)a - (double)S[i];
-                e += d * d;
+                double s = lim / (wmn[i / CH] * 1.05);
+                long long b = 0;
+                for (int n = 0; n < G; ++n)
+                    b = sat_add(b, std::max(-lim, std::min(lim, (long long)llrint((double)ng[n][i] * s))),
+                                lim, &sat);
+                out[i] = b / s;
             }
-            base_f = 100.0 * sqrt(e) / sn;
-            report("flat bf16", base_f, 0);
+            report(W == 16 ? "hier, exact intra + int16 inter" : "hier, exact intra + int8 inter", out);
         }
-
-        // --- 2. hier bf16: fewer hops, but it still rounds at every one of
-        // them, INCLUDING when a node result crosses to the inter-node ring.
-        {
-            double e = 0;
-            for (int i = 0; i < NEL; ++i) {
-                std::vector<float> nv(G);
-                for (int n = 0; n < G; ++n) {
-                    float a = to_bf16((float)g[n * L][i]);
-                    for (int l = 1; l < L; ++l)
-                        a = to_bf16(a + to_bf16((float)g[n * L + l][i]));
-                    nv[n] = a;
-                }
-                float b = nv[0];
-                for (int n = 1; n < G; ++n) b = to_bf16(b + nv[n]);
-                double d = (double)b - (double)S[i];
-                e += d * d;
-            }
-            report("hier bf16", 100.0 * sqrt(e) / sn, base_f);
-        }
-
-        // --- 3. flat int16: every rank quantizes onto a shared grid, then the
-        // ring adds integers.
-        {
-            double lim = 32767.0, e = 0;
-            for (int c = 0; c < NC; ++c) {
-                double s = wm[c] > 0 ? lim / (wm[c] * 1.05) : 1.0;
-                for (int j = 0; j < CH; ++j) {
-                    int i = c * CH + j;
-                    double tot = 0;
-                    for (int r = 0; r < P; ++r) {
-                        double q = (double)llrint((double)g[r][i] * s);
-                        tot += std::max(-lim, std::min(lim, q)) / s;
-                    }
-                    double d = tot - (double)S[i];
-                    e += d * d;
-                }
-            }
-            flat_err = 100.0 * sqrt(e) / sn;
-            report("flat int16", flat_err, base_f);
-        }
-
-        // --- 4. hier int16, QUANTIZED ONCE AT THE SOURCE. The intra-node ring
-        // and the inter-node ring both add integers on the same grid, so
-        // neither one rounds. This is the design closure actually buys, and it
-        // must come out bit-identical to row 3 -- the topology has stopped
-        // being a numerical parameter at all.
-        {
-            double lim = 32767.0, e = 0;
-            for (int c = 0; c < NC; ++c) {
-                double s = wm[c] > 0 ? lim / (wm[c] * 1.05) : 1.0;
-                for (int j = 0; j < CH; ++j) {
-                    int i = c * CH + j;
-                    double tot = 0;
-                    for (int n = 0; n < G; ++n) {
-                        double nodesum = 0;
-                        for (int l = 0; l < L; ++l) {
-                            double q = (double)llrint((double)g[n * L + l][i] * s);
-                            nodesum += std::max(-lim, std::min(lim, q));
-                        }
-                        tot += nodesum / s;
-                    }
-                    double d = tot - (double)S[i];
-                    e += d * d;
-                    maxdiff = std::max(maxdiff, fabs(tot - (double)S[i]));
-                }
-            }
-            once_err = 100.0 * sqrt(e) / sn;
-            report("hier int16, quantize once at source", once_err, base_f);
-        }
-
-        // --- 5. hier with a REQUANTIZATION at the node boundary: the intra
-        // stage carries exact integers, then each node result is re-encoded
-        // once for the slow link. G roundings instead of P.
-        {
-            double lim = 32767.0, e = 0;
-            for (int c = 0; c < NC; ++c) {
-                double s = wmn[c] > 0 ? lim / (wmn[c] * 1.05) : 1.0;
-                for (int j = 0; j < CH; ++j) {
-                    int i = c * CH + j;
-                    double tot = 0;
-                    for (int n = 0; n < G; ++n) {
-                        double q = (double)llrint((double)ng[n][i] * s);
-                        tot += std::max(-lim, std::min(lim, q)) / s;
-                    }
-                    double d = tot - (double)S[i];
-                    e += d * d;
-                }
-            }
-            report("hier, exact intra + int16 inter", 100.0 * sqrt(e) / sn, base_f);
-        }
-
-        // --- 6. the same thing with a 1-byte slow link.
-        {
-            double lim = 127.0, e = 0;
-            for (int c = 0; c < NC; ++c) {
-                double s = wmn[c] > 0 ? lim / (wmn[c] * 1.05) : 1.0;
-                for (int j = 0; j < CH; ++j) {
-                    int i = c * CH + j;
-                    double tot = 0;
-                    for (int n = 0; n < G; ++n) {
-                        double q = (double)llrint((double)ng[n][i] * s);
-                        tot += std::max(-lim, std::min(lim, q)) / s;
-                    }
-                    double d = tot - (double)S[i];
-                    e += d * d;
-                }
-            }
-            report("hier, exact intra + int8 inter", 100.0 * sqrt(e) / sn, base_f);
-        }
-
-        printf("    %6s %5s %6s  rows 3 and 4 differ by %.3e -- %s\n", "", "", "",
-               fabs(flat_err - once_err),
-               fabs(flat_err - once_err) < 1e-12 ? "IDENTICAL, as closure requires"
-                                                : "MISMATCH");
-        printf("\n");
+        int diff = 0;
+        for (int i = 0; i < NEL; ++i) diff += t3[i] != t4[i];
+        printf("    %6s %5s %6s  flat vs hier int16 totals: %d of %d integers differ; %lld saturated hops\n\n",
+               "", "", "", diff, NEL, sat);
     }
-
-    printf("    Row 4 is the result. Quantize once at the source and every sum\n");
-    printf("    afterwards is exact integer addition, so a two-level hierarchy\n");
-    printf("    gives BIT-IDENTICAL output to a flat ring -- the same number, not a\n");
-    printf("    close one. Topology stops being a numerical parameter. Compare row 2:\n");
-    printf("    a bf16 hierarchy has to round when a node result crosses to the\n");
-    printf("    inter-node ring, so changing the cluster shape changes the answer.\n");
-    printf("\n    Rows 5 and 6 buy accuracy instead of reproducibility. Reducing the\n");
-    printf("    node exactly and quantizing once PER NODE means G roundings instead\n");
-    printf("    of P, and errors add in quadrature, so the gain is sqrt(L) = %.2f at\n", sqrt(8.0));
-    printf("    8 GPUs per node. int16 delivers it. int8 gets only ~1.95x, because\n");
-    printf("    at 7 bits the per-chunk dynamic range starts binding before the\n");
-    printf("    rounding count does -- the [14] effect showing up again.\n");
-    printf("\n    But this is NOT free, and the time model below is what says so.\n");
-
-    // ------------------------------------------------------------------ time
     const double NP = 7.0e9, NVL = 450e9, IB = 50e9;
     const int G = 128, L = 8, P = G * L;
-    printf("\n    Time model, one 7B gradient all-reduce, %d nodes x %d GPUs,\n", G, L);
-    printf("    NVLink %.0f GB/s intra, IB %.0f GB/s inter:\n", NVL / 1e9, IB / 1e9);
-    printf("\n    %-38s %9s %9s %9s %11s\n",
-           "scheme", "intra ms", "inter ms", "total ms", "roundings");
+    printf("    time, one 7B all-reduce, %d nodes x %d GPUs, NVLink %.0f GB/s, IB %.0f GB/s:\n",
+           G, L, NVL / 1e9, IB / 1e9);
+    printf("\n    %-38s %9s %9s %9s %11s\n", "scheme", "intra ms", "inter ms", "total ms", "roundings");
     struct TR { const char *nm; double b_in, b_out; bool hier; const char *rnd; };
-    for (TR tr : {TR{"flat ring, bf16", 0, 2.0, false, "every hop"},
-                  TR{"flat ring, int16", 0, 2.0, false, "P"},
-                  TR{"hier, bf16", 2.0, 2.0, true, "every hop"},
-                  TR{"hier, int16 quantize-once", 2.03, 2.03, true, "P"},
-                  TR{"hier, exact(int32) intra + int16", 4.0, 2.03, true, "G"},
-                  TR{"hier, int16 intra + int8 inter+EF", 2.03, 1.03, true, "P + G"}}) {
-        double intra = 0, inter = 0;
-        if (tr.hier) {
-            intra = (2.0 * (L - 1) / L) * NP * tr.b_in / NVL * 1e3;
-            inter = (2.0 * (G - 1) / G) * (NP / L) * tr.b_out / IB * 1e3;
-        } else {
-            inter = (2.0 * (P - 1) / P) * NP * tr.b_out / IB * 1e3;
-        }
-        printf("    %-38s %9.2f %9.2f %9.2f %11s\n",
-               tr.nm, intra, inter, intra + inter, tr.rnd);
+    const TR trs[] = {{"flat ring, bf16", 0, 2.0, false, "every hop"},
+                      {"flat ring, int16", 0, 2.03, false, "P"},
+                      {"hier, bf16", 2.0, 2.0, true, "every hop"},
+                      {"hier, int16 quantize-once", 2.03, 2.03, true, "P"},
+                      {"hier, exact(int32) intra + int16", 4.0, 2.03, true, "G"},
+                      {"hier, int16 intra + int8 inter", 2.03, 1.03, true, "P + G"}};
+    double tt[6];
+    for (int k = 0; k < 6; ++k) {
+        const TR &tr = trs[k];
+        double intra = tr.hier ? (2.0 * (L - 1) / L) * NP * tr.b_in / NVL * 1e3 : 0.0;
+        double inter = tr.hier ? (2.0 * (G - 1) / G) * (NP / L) * tr.b_out / IB * 1e3
+                               : (2.0 * (P - 1) / P) * NP * tr.b_out / IB * 1e3;
+        tt[k] = intra + inter;
+        printf("    %-38s %9.2f %9.2f %9.2f %11s\n", tr.nm, intra, inter, tt[k], tr.rnd);
     }
-
-    printf("\n    Read this against the error table and the ranking changes.\n");
-    printf("\n    The hierarchy itself is worth 4.5x and has nothing to do with this\n");
-    printf("    repo -- it divides the inter-node payload by L before it reaches the\n");
-    printf("    slow link, which is why everyone already does it. What IS ours is\n");
-    printf("    that row 4 costs 1.5%% more bytes than the bf16 hierarchy -- 126 ms\n");
-    printf("    against 124, the difference being the scale bytes -- and returns\n");
-    printf("    bit-identical results to a flat ring while doing it.\n");
-    printf("\n    The sqrt(L) accuracy row is a trap and the time model catches it:\n");
-    printf("    carrying int32 intra-node doubles the fast-link traffic and lands at\n");
-    printf("    179 ms against the bf16 hierarchy's 125 ms. Paying 43%% more wall\n");
-    printf("    clock for 2.8x accuracy you did not ask for is a bad trade. The\n");
-    printf("    accuracy was never free -- it was on the NVLink bill.\n");
-    printf("\n    The last row is where the stack pays off: int16 on the fast link,\n");
-    printf("    int8 plus [15]'s error feedback on the slow one, 91 ms against the\n");
-    printf("    bf16 hierarchy's 124 ms at comparable accuracy on the accumulated\n");
-    printf("    metric. 1.36x on the collective, and 6.1x against a flat bf16 ring.\n");
-    printf("\n    Caveat on that last row: [15] measured int8+EF over 128 steps at 32\n");
-    printf("    ranks, not over a real run at 1024. It is the row most worth\n");
-    printf("    building for real and the one least entitled to be quoted yet.\n");
+    printf("\n    hier bf16 vs flat bf16 %.2fx; int16 quantize-once costs %+.1f%% over hier bf16;\n",
+           tt[0] / tt[2], 100.0 * (tt[3] / tt[2] - 1));
+    printf("    int32 intra costs %+.1f%%; int16 intra + int8 inter is %.2fx faster than hier bf16.\n",
+           100.0 * (tt[4] / tt[2] - 1), tt[2] / tt[5]);
 }
 
 // ============================================================================
