@@ -1575,60 +1575,20 @@ static void exp_tiers() {
 }
 
 // ============================================================================
-// [18] moe -- the same wire, on an all-to-all instead of an all-reduce
+// [18] moe -- the same wire on an all-to-all
 // ============================================================================
-//
-// Everything from [11] to [17] is about all-REDUCE: P contributions summed into
-// one answer. Mixture-of-experts training is dominated by a different
-// collective, all-to-ALL, and it is worth asking honestly which parts of the
-// story transfer, because the answer is "one of the three, cleanly, and the
-// other two not at all".
-//
-// What an MoE step does:
-//
-//   dispatch   each token is routed to its top-k experts, which live on other
-//              ranks. Every rank sends a different slice to every other rank.
-//              This is a PERMUTATION. Nothing is summed in flight.
-//   combine    each expert returns its output, and the token's final value is
-//              the router-weighted sum of its k expert outputs -- k additions,
-//              performed at the destination.
-//
-// So:
-//
-//   BITS transfers completely. Dispatch and combine payloads are activations,
-//   and a fixed-point grid spends all its bits on mantissa exactly as it does
-//   for gradients. This is the part that works.
-//
-//   CLOSURE almost entirely does not. Its value scales with the number of
-//   additions performed ON THE WIRE, and an all-to-all performs zero. The
-//   combine has k of them (k=2 typically) against an all-reduce's P-1 = 1023.
-//   Closure was never an accuracy argument anyway ([13] measured it at
-//   1.000x), but even the reproducibility guarantee is worth less here,
-//   because there is no reduction order to be independent of.
-//
-//   ERROR FEEDBACK does not transfer, and the reason is interesting enough to
-//   measure rather than assert. Feedback works by holding a residual at a
-//   fixed index and replaying it into the same quantity next step. In MoE the
-//   routing is re-decided every step, so the residual left by token slot t on
-//   its way to expert A gets replayed into whatever token slot t sends to
-//   expert B. It is a correction applied to the wrong quantity. The control
-//   for this is to FREEZE the routing and watch feedback start working again.
-
+// Dispatch is a permutation (no additions in flight); combine is a k-term
+// weighted sum at the destination. A: dispatch payload quantization. B: an
+// integer combine. C: error feedback on dispatched activations, measured on
+// both the plain per-expert activation sum and the expert's weight gradient
+// sum_t x_t * delta_t, which is what the activations actually feed.
 static void exp_moe() {
     printf("\n[18] MoE all-to-all: which parts of the wire story transfer?\n");
-
-    const int NTOK = 512;        // tokens per rank
-    const int DM = 256;          // model dimension
-    const int TOPK = 2;
-    const int CH = 64;           // scale block within a token vector
-
+    const int NTOK = 512, DM = 256, TOPK = 2, CH = 64;
     std::normal_distribution<double> nd(0.0, 1.0);
     std::uniform_real_distribution<double> ur(0.0, 1.0);
 
-    // ---------------------------------------------------------------- part A
-    printf("\n    A. dispatch payload: a permutation, so this is pure quantization\n");
-    printf("       %d tokens x %d dims, activations N(0,1) with 1%% at 15 sigma.\n", NTOK, DM);
-
+    printf("\n    A. dispatch payload, %d tokens x %d dims, N(0,1) with 1%% at 15 sigma\n", NTOK, DM);
     std::vector<double> act((size_t)NTOK * DM);
     for (size_t i = 0; i < act.size(); ++i) {
         act[i] = nd(rng);
@@ -1637,18 +1597,17 @@ static void exp_moe() {
     double an = 0;
     for (double v : act) an += v * v;
     an = sqrt(an);
-
-    printf("\n    %-34s %7s %14s\n", "wire format", "b/el", "rel err (RMS)");
-    // bf16
+    printf("\n    %-34s %7s %14s\n", "wire", "b/el", "rel err (RMS)");
+    double e_bf16, e_fp8, e_i16, e_i8;
     {
         double e = 0;
         for (size_t i = 0; i < act.size(); ++i) {
             double q = (double)to_bf16((float)act[i]);
             e += (q - act[i]) * (q - act[i]);
         }
-        printf("    %-34s %7.3f %13.4f%%\n", "bf16", 2.0, 100.0 * sqrt(e) / an);
+        e_bf16 = 100.0 * sqrt(e) / an;
+        printf("    %-34s %7.3f %13.4f%%\n", "bf16", 2.0, e_bf16);
     }
-    // fp8 e4m3, per-token scale
     {
         double e = 0;
         for (int t = 0; t < NTOK; ++t) {
@@ -1661,10 +1620,9 @@ static void exp_moe() {
                 e += (q - v) * (q - v);
             }
         }
-        printf("    %-34s %7.3f %13.4f%%\n", "fp8 e4m3, per-token scale",
-               1.0 + 2.0 / DM, 100.0 * sqrt(e) / an);
+        e_fp8 = 100.0 * sqrt(e) / an;
+        printf("    %-34s %7.3f %13.4f%%\n", "fp8 e4m3, per-token scale", 1.0 + 2.0 / DM, e_fp8);
     }
-    // integer wires at several widths and block sizes
     for (int W : {16, 8, 6, 4}) {
         for (int BL : {DM, CH}) {
             double lim = (double)((1 << (W - 1)) - 1), e = 0;
@@ -1681,34 +1639,19 @@ static void exp_moe() {
                     }
                 }
             }
+            e = 100.0 * sqrt(e) / an;
+            if (BL == CH && W == 16) e_i16 = e;
+            if (BL == CH && W == 8) e_i8 = e;
             char nm[64];
             snprintf(nm, sizeof nm, "int%d, per-%d scale", W, BL);
-            printf("    %-34s %7.3f %13.4f%%\n", nm, W / 8.0 + 2.0 / BL,
-                   100.0 * sqrt(e) / an);
+            printf("    %-34s %7.3f %13.4f%%\n", nm, W / 8.0 + 2.0 / BL, e);
         }
     }
-    printf("\n       Read this table by BYTES, not down the column. bf16 at 0.164%%\n");
-    printf("       looks like it beats int8 at 1.449%%, and it does -- it is also\n");
-    printf("       twice the size. The two honest comparisons are:\n");
-    printf("\n         2 bytes:  bf16 0.1639%%  vs  int16/per-64  (see table)\n");
-    printf("         1 byte:   fp8  1.8849%%  vs  int8 /per-64  1.4488%%   1.30x\n");
-    printf("\n       So the bits argument transfers, for the same reason as everywhere\n");
-    printf("       else -- a float wire spends its exponent field on dynamic range\n");
-    printf("       that block scaling has already removed -- but the margin is much\n");
-    printf("       thinner than it is for gradients. There is no accumulation here to\n");
-    printf("       amplify a float's per-hop rounding, so a float only loses its\n");
-    printf("       static precision disadvantage and nothing more.\n");
-    printf("\n       Note also that block granularity is worth about as much as a bit:\n");
-    printf("       per-64 beats per-256 by 1.7x at every width. On activations with\n");
-    printf("       real outliers that is the cheaper knob.\n");
-    printf("\n       Nothing in this section needs closure, FP4, or a reduction. It is\n");
-    printf("       ordinary quantization, and it is the only one of the three ideas\n");
-    printf("       that survives contact with an all-to-all.\n");
+    printf("    equal bytes: int16/per-64 vs bf16 %.1fx; int8/per-64 vs fp8 %.2fx\n",
+           e_bf16 / e_i16, e_fp8 / e_i8);
 
-    // ---------------------------------------------------------------- part B
-    printf("\n    B. combine: does closure buy anything when k=%d instead of P=1024?\n", TOPK);
+    printf("\n    B. combine, k=%d: sum_k w_k * y_k with an int8 payload\n", TOPK);
     {
-        // Each token's output is sum_k w_k * y_k, w from a softmax router.
         std::vector<double> y((size_t)NTOK * TOPK * DM), w((size_t)NTOK * TOPK);
         for (size_t i = 0; i < y.size(); ++i) y[i] = nd(rng);
         for (int t = 0; t < NTOK; ++t) {
@@ -1724,9 +1667,6 @@ static void exp_moe() {
         double rn = 0;
         for (double v : ref) rn += v * v;
         rn = sqrt(rn);
-
-        printf("\n    %-40s %14s\n", "combine scheme", "rel err (RMS)");
-        // int8 payload, float router weights, float accumulate.
         auto run_combine = [&](bool intw) {
             double lim = 127.0, e = 0;
             for (int t = 0; t < NTOK; ++t) {
@@ -1752,105 +1692,55 @@ static void exp_moe() {
             }
             return 100.0 * sqrt(e) / rn;
         };
-        printf("    %-40s %13.4f%%\n", "int8 payload, fp32 router weights", run_combine(false));
-        printf("    %-40s %13.4f%%\n", "int8 payload, int8 router weights", run_combine(true));
-        printf("\n       Putting the router weights on a grid too makes the combine a\n");
-        printf("       pure integer operation -- and it is WORSE, because k=%d additions\n", TOPK);
-        printf("       were never the problem and the quantized weight is. Closure pays\n");
-        printf("       in proportion to how many additions happen on the wire. An\n");
-        printf("       all-reduce over 1024 ranks has 1023 of them. An all-to-all has\n");
-        printf("       zero, and the combine that follows it has two.\n");
+        printf("    %-40s %13.4f%%\n", "fp32 router weights", run_combine(false));
+        printf("    %-40s %13.4f%%\n", "int8 router weights (all-integer combine)", run_combine(true));
     }
 
-    // ---------------------------------------------------------------- part C
-    printf("\n    C. error feedback when the router keeps moving the data\n");
-    printf("       [15] showed feedback bounds the accumulated error, because the\n");
-    printf("       residual sits at an index and gets replayed into the same quantity\n");
-    printf("       next step. MoE breaks the second half of that sentence, and the\n");
-    printf("       question is whether it matters.\n");
-    printf("\n       The quantity that actually accumulates across steps in an MoE is\n");
-    printf("       NOT the token -- activations are consumed and discarded. It is the\n");
-    printf("       EXPERT's weight gradient, which sums over whichever tokens the\n");
-    printf("       router happened to send it. So the error that matters is indexed\n");
-    printf("       by (expert, channel), while the natural place to hold a residual\n");
-    printf("       is the token slot you are about to send. Those are different\n");
-    printf("       indices, and the router shuffles the mapping every step.\n");
-
+    printf("\n    C. error feedback under a live router, int6 per-64, 8 experts, 64 steps\n");
     {
-        const int TSTEP = 64, NEXP = 8, W = 6;
+        const int TSTEP = 64, NEXP = 8, W = 6, DO = 4;     // DO backward signals per token
         const double lim = (double)((1 << (W - 1)) - 1);
-        printf("\n    %-34s %16s %11s\n", "residual keyed by", "accum err (expert)", "drift/step");
-
-        // 0 = no feedback, 1 = keyed by token slot (the naive port),
-        // 2 = keyed by (expert, channel) (the fix).
-        for (int mode = 0; mode < 3; ++mode) {
-            std::vector<double> r_tok((size_t)NTOK * DM, 0.0);
-            std::vector<double> r_exp((size_t)NEXP * DM, 0.0);
+        printf("\n    %-32s %16s %18s\n", "residual keyed by", "activation sum", "weight gradient");
+        for (int mode = 0; mode < 3; ++mode) {             // none, token slot, (expert, channel)
+            std::vector<double> r_tok((size_t)NTOK * DM, 0.0), r_exp((size_t)NEXP * DM, 0.0);
             std::vector<double> acc((size_t)NEXP * DM, 0.0), exa((size_t)NEXP * DM, 0.0);
+            std::vector<double> gacc((size_t)NEXP * DM * DO, 0.0), gexa((size_t)NEXP * DM * DO, 0.0);
             std::vector<double> esig((size_t)NEXP * DM);
-            for (size_t i = 0; i < esig.size(); ++i) esig[i] = nd(rng) * 0.05;
-            std::vector<int> route(NTOK);
-
+            for (auto &x : esig) x = nd(rng) * 0.05;       // small persistent per-expert signal
             for (int st = 0; st < TSTEP; ++st) {
-                for (int t = 0; t < NTOK; ++t) route[t] = (int)(ur(rng) * NEXP) % NEXP;
                 for (int t = 0; t < NTOK; ++t) {
-                    int ex = route[t];
+                    int ex = (int)(ur(rng) * NEXP) % NEXP;
+                    double dl[DO];
+                    for (int o = 0; o < DO; ++o) dl[o] = nd(rng);
                     for (int b = 0; b < DM; b += CH) {
-                        std::vector<double> v(CH);
-                        double am = 0;
+                        double v[CH], am = 0;
                         for (int j = 0; j < CH; ++j) {
                             v[j] = nd(rng) + esig[(size_t)ex * DM + b + j];
                             am = std::max(am, fabs(v[j]));
                         }
                         double s = am > 0 ? lim / (am * 1.05) : 1.0;
                         for (int j = 0; j < CH; ++j) {
-                            size_t ti = (size_t)t * DM + b + j;
-                            size_t ei = (size_t)ex * DM + b + j;
-                            double res = mode == 1 ? r_tok[ti] : (mode == 2 ? r_exp[ei] : 0.0);
-                            double x = v[j] + res;
-                            double q = std::max(-lim, std::min(lim, (double)llrint(x * s)));
-                            if (mode == 1) r_tok[ti] = x - q / s;
-                            if (mode == 2) r_exp[ei] = x - q / s;
-                            // The expert accumulates what it received.
-                            acc[ei] += q / s;
+                            size_t ti = (size_t)t * DM + b + j, ei = (size_t)ex * DM + b + j;
+                            double x = v[j] + (mode == 1 ? r_tok[ti] : mode == 2 ? r_exp[ei] : 0.0);
+                            double q = std::max(-lim, std::min(lim, (double)llrint(x * s))) / s;
+                            if (mode == 1) r_tok[ti] = x - q;
+                            if (mode == 2) r_exp[ei] = x - q;
+                            acc[ei] += q;
                             exa[ei] += v[j];
+                            for (int o = 0; o < DO; ++o) {
+                                gacc[ei * DO + o] += q * dl[o];
+                                gexa[ei * DO + o] += v[j] * dl[o];
+                            }
                         }
                     }
                 }
             }
-            double e = 0, n = 0;
-            for (size_t i = 0; i < acc.size(); ++i) {
-                double d = acc[i] - exa[i];
-                e += d * d;
-                n += exa[i] * exa[i];
-            }
-            double rel = sqrt(e) / sqrt(n);
-            const char *nm = mode == 0 ? "nothing (no feedback)"
-                           : mode == 1 ? "token slot (naive port of [15])"
-                                       : "(expert, channel)";
-            printf("    %-34s %15.4f%% %11.3f\n", nm, 100.0 * rel, rel * TSTEP);
+            const char *nm = mode == 0 ? "nothing" : mode == 1 ? "token slot" : "(expert, channel)";
+            printf("    %-32s %15.4f%% %17.4f%%\n", nm, 100.0 * rel_err(acc, exa), 100.0 * rel_err(gacc, gexa));
         }
     }
-    printf("\n       Keying the residual on the token slot is WORSE than having no\n");
-    printf("       feedback at all -- 0.633 drift against 0.518. The correction is\n");
-    printf("       computed against the token that left and then replayed into a\n");
-    printf("       token going somewhere else, so it lands in the wrong expert's\n");
-    printf("       accumulator: it adds variance rather than cancelling anything.\n");
-    printf("\n       Keying it on (expert, channel) works, because that index is the\n");
-    printf("       one the error actually accumulates in and the router cannot move\n");
-    printf("       it. The buffer is also far smaller -- NEXP*DM instead of NTOK*DM.\n");
-    printf("\n       So error feedback does transfer to MoE, but not by porting [15].\n");
-    printf("       It has to be re-derived around the index that is stable, and\n");
-    printf("       working out which index that is required asking what quantity\n");
-    printf("       actually accumulates across steps. For an all-reduce it is the\n");
-    printf("       parameter; here it is the expert channel; a first version of this\n");
-    printf("       experiment measured per-token error and concluded there was no\n");
-    printf("       problem, which was the wrong metric giving a reassuring answer.\n");
 
-    // ---------------------------------------------------------------- part D
-    printf("\n    D. bytes: one MoE layer, 8 experts, top-2, per training step\n");
-    printf("       Tokens are dispatched AND combined, so the a2a payload is paid\n");
-    printf("       twice forward and twice backward: 4x tokens*d_model*k.\n");
+    printf("\n    D. bytes, one MoE layer (32768 tokens, d=4096, top-2), dispatch+combine, fwd+bwd, IB 50 GB/s\n");
     const double TOKENS = 4096 * 8, DMOD = 4096;
     printf("\n    %-24s %10s %12s %12s %10s\n", "wire", "b/el", "GB/layer", "IB ms", "vs bf16");
     double bb = 0;
@@ -1862,11 +1752,6 @@ static void exp_moe() {
         if (bb == 0) bb = ms;
         printf("    %-24s %10.3f %12.3f %12.2f %9.2fx\n", pr.first, pr.second, gb, ms, bb / ms);
     }
-    printf("\n       MoE a2a is the one collective where 4-bit and 6-bit are plausible\n");
-    printf("       rather than aspirational, because activations tolerate far more\n");
-    printf("       noise than gradients do and there is no accumulation across ranks\n");
-    printf("       to amplify it. That is the opposite of the conclusion for\n");
-    printf("       all-reduce, and it comes from the same table of numbers.\n");
 }
 
 // ============================================================================
