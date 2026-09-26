@@ -1755,49 +1755,18 @@ static void exp_moe() {
 }
 
 // ============================================================================
-// [19] chain -- keeping the partials integral from GEMM output to all-reduce
+// [19] chain -- keeping the partials integral from GEMM output to the wire
 // ============================================================================
-//
-// Every experiment so far tested one link of the chain in isolation. This one
-// asks whether the value can stay an INTEGER the whole way: out of the FP4
-// GEMM, through the split-K reduction, across the wire, through the all-reduce,
-// and only become a float at the very end. No dequantize, no requantize, no
-// intermediate float at all.
-//
-// The obstacle is the block scale, and it is worth being precise about why.
-//
-// A K-deep MXFP4 dot product is not one integer. It is a sum over K/32 blocks,
-// each with its own scale:  sum_b  X_b * dot_b,  where dot_b is an integer
-// bounded by 144*32 and X_b is the block scale. The conventional mainloop
-// dequantizes at every block boundary -- multiply dot_b by X_b into an fp32
-// accumulator -- and that multiply is where the value stops being an integer
-// and starts rounding, once per block, before it has gone anywhere.
-//
-// But in MX formats X_b is E8M0: a bare POWER OF TWO. So X_b * dot_b is
-// dot_b shifted, and a sum of shifted integers is an integer, exactly, in a
-// wide enough field. Align every block to the smallest exponent in the tile
-// and the entire dot product is one exact integer.
-//
-// Which produces a genuinely awkward trade with [8]. That experiment measured
-// NVFP4 beating MXFP4 by 1.23x clean and 1.83x on outliers, and recommended
-// switching, because NVFP4's E4M3 scale has a mantissa and lands closer to
-// amax/6. That mantissa is exactly what breaks this. MXFP4's worse scale
-// format is the one that makes an integral chain possible.
-//
-// The field width you need is bits(144*d) + the exponent SPREAD across the
-// blocks being summed, so the first thing to measure is that spread.
-
+// An MXFP4 dot product is sum_b X_b * dot_b with X_b an E8M0 power of two, so
+// X_b * dot_b is a shift and the whole sum is one exact integer once blocks are
+// aligned to the smallest exponent. NVFP4's E4M3 scale is not a power of two.
 static void exp_chain() {
     printf("\n[19] end-to-end integral: GEMM -> split-K -> wire -> all-reduce\n");
-
     std::uniform_int_distribution<int> cd(0, 14);
     std::normal_distribution<double> nd(0.0, 1.0);
     std::uniform_real_distribution<double> ur(0.0, 1.0);
 
-    // ---------------------------------------------------------------- part A
-    printf("\n    A. E8M0 block-scale exponent spread on realistic activations\n");
-    printf("       The integral accumulator must span every block it sums, so its\n");
-    printf("       width is bits(144*d) plus this spread. Measured over blocks of 32.\n");
+    printf("\n    A. E8M0 block-exponent spread per row (blocks of 32)\n");
     printf("\n    %10s %10s %14s %14s %14s\n", "K", "outliers", "mean spread", "p99 spread", "max spread");
     for (int K : {512, 2048, 8192}) {
         for (int outl = 0; outl < 2; ++outl) {
@@ -1828,11 +1797,9 @@ static void exp_chain() {
         }
     }
 
-    // ---------------------------------------------------------------- part B
-    printf("\n    B. accumulator width for an EXACT integral dot product\n");
-    printf("       bits = bits(144*32) + log2(blocks) + exponent spread\n");
-    printf("\n    %8s %10s %10s %10s %8s %10s\n",
-           "K", "blocks", "base bits", "spread", "total", "fits");
+    printf("\n    B. accumulator width for an exact integral dot product\n");
+    printf("       bits = bits(144*32) + bits(blocks) + exponent spread\n");
+    printf("\n    %8s %10s %10s %10s %8s %10s\n", "K", "blocks", "base bits", "spread", "total", "fits");
     for (int K : {512, 2048, 8192, 32768}) {
         int blocks = K / 32;
         int base = bits_of((long long)FP4_PMAX * 32);
@@ -1842,258 +1809,118 @@ static void exp_chain() {
                    need <= 31 ? "int32" : (need <= 63 ? "int64" : "no"));
         }
     }
-    printf("\n       An int32 accumulator covers realistic depths at a clean spread and\n");
-    printf("       runs out on outlier-heavy data at K=32768. That is the real limit\n");
-    printf("       of the integral chain, and it is a much friendlier limit than the\n");
-    printf("       one the packed-operand idea hit in [7], because it is about RANGE,\n");
-    printf("       which you can buy with a wider accumulator, not about SIGNIFICAND,\n");
-    printf("       which no Hopper format has.\n");
 
-    // ---------------------------------------------------------------- part C
-    printf("\n    C. rounding events in each chain, and the measured end-to-end error\n");
-
-    const int NEL = 2048, S = 32, DEP = 32, P = 64;
-    const int NBLK = 4;                          // blocks per split, each 32 deep
-    printf("\n       %d outputs, %d splits of depth %d, %d blocks per split, %d ranks.\n",
-           NEL, S, DEP, NBLK, P);
-
-    // Build the ground truth in exact rational form: integer dot products with
-    // power-of-two scales, so an fp64 reference is exact.
-    std::vector<std::vector<double>> gr(P, std::vector<double>(NEL, 0.0));
-    std::vector<std::vector<std::vector<long long>>> dotv(
-        P, std::vector<std::vector<long long>>(NEL));
-    std::vector<std::vector<std::vector<int>>> expv(
-        P, std::vector<std::vector<int>>(NEL));
+    printf("\n    C. rounding events per chain, and the measured end-to-end error\n");
+    const int NEL = 2048, S = 32, DEP = 32, P = 64, NBLK = 4, NB = S * NBLK;
+    printf("       %d outputs, %d splits of depth %d, %d blocks per split, %d ranks, spread 7\n",
+           NEL, S, DEP * NBLK, NBLK, P);
+    // Integer dot products with power-of-two scales, so the fp64 reference is exact.
+    std::vector<std::vector<std::vector<long long>>> dotv(P, std::vector<std::vector<long long>>(NEL));
+    std::vector<std::vector<std::vector<int>>> expv(P, std::vector<std::vector<int>>(NEL));
     std::vector<double> S_exact(NEL, 0.0);
     for (int r = 0; r < P; ++r) {
         for (int i = 0; i < NEL; ++i) {
-            dotv[r][i].resize((size_t)S * NBLK);
-            expv[r][i].resize((size_t)S * NBLK);
-            double acc = 0;
-            for (int t = 0; t < S * NBLK; ++t) {
-                long long d = 0;
-                for (int k = 0; k < DEP; ++k)
-                    d += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                int e = (int)(ur(rng) * 8.0) - 10;       // E8M0 exponent, spread 8
+            dotv[r][i].resize(NB);
+            expv[r][i].resize(NB);
+            for (int t = 0; t < NB; ++t) {
+                long long d = fp4_dot(DEP, cd);
+                int e = (int)(ur(rng) * 8.0) - 10;
                 dotv[r][i][t] = d;
                 expv[r][i][t] = e;
-                acc += (double)d * ldexp(1.0, e);        // exact in fp64
+                S_exact[i] += (double)d * ldexp(1.0, e);         // exact in fp64
             }
-            gr[r][i] = acc;
-            S_exact[i] += acc;
         }
     }
     double sn = 0;
     for (int i = 0; i < NEL; ++i) sn += S_exact[i] * S_exact[i];
     sn = sqrt(sn);
-
-    struct Res { const char *nm; const char *rnd; double err; double bpw; };
+    int emin = 1000;
+    for (int r = 0; r < P; ++r)
+        for (int i = 0; i < NEL; ++i)
+            for (int t = 0; t < NB; ++t) emin = std::min(emin, expv[r][i][t]);
+    // One rank's split-K output: fp32 dequantize-and-accumulate, or aligned int64.
+    auto fp32_partial = [&](int r, int i) {
+        float a = 0.f;
+        for (int t = 0; t < NB; ++t) a += (float)dotv[r][i][t] * ldexpf(1.0f, expv[r][i][t]);
+        return a;
+    };
+    auto aligned = [&](int r, int i) {
+        long long a = 0;
+        for (int t = 0; t < NB; ++t) a += dotv[r][i][t] * (1LL << (expv[r][i][t] - emin));
+        return a;
+    };
+    struct Res { const char *nm; const char *rnd; double err, bpw; };
     std::vector<Res> rows;
-
-    // --- conventional: dequantize each block into fp32, accumulate in fp32,
-    // narrow to bf16 for the wire, round at every hop.
-    {
+    auto err_of = [&](auto out) {
         double e = 0;
-        for (int i = 0; i < NEL; ++i) {
-            float tot = 0.f;
-            for (int r = 0; r < P; ++r) {
-                float a = 0.f;
-                for (int t = 0; t < S * NBLK; ++t)
-                    a += (float)dotv[r][i][t] * ldexpf(1.0f, expv[r][i][t]);
-                float wv = to_bf16(a);
-                tot = r == 0 ? wv : to_bf16(tot + wv);
-            }
-            double d = (double)tot - S_exact[i];
-            e += d * d;
+        for (int i = 0; i < NEL; ++i) { double d = out(i) - S_exact[i]; e += d * d; }
+        return 100.0 * sqrt(e) / sn;
+    };
+    rows.push_back({"fp32 dequant + bf16 ring", "S*NBLK + P", err_of([&](int i) {
+        float tot = 0.f;
+        for (int r = 0; r < P; ++r) { float w = to_bf16(fp32_partial(r, i)); tot = r ? to_bf16(tot + w) : w; }
+        return (double)tot; }), 2.0});
+    rows.push_back({"fp32 dequant + fp32 ring", "S*NBLK + P", err_of([&](int i) {
+        float tot = 0.f;
+        for (int r = 0; r < P; ++r) tot += fp32_partial(r, i);
+        return (double)tot; }), 4.0});
+    const double base = ldexp(1.0, emin);
+    double wmax = 0, pmax = 0;
+    for (int i = 0; i < NEL; ++i) {
+        long long run = 0;
+        for (int r = 0; r < P; ++r) {
+            long long a = aligned(r, i);
+            pmax = std::max(pmax, (double)llabs(a));
+            run += a;
+            wmax = std::max(wmax, (double)llabs(run));
         }
-        rows.push_back({"fp32 dequant + bf16 wire", "S*NBLK + 1 + P", 100.0 * sqrt(e) / sn, 2.0});
     }
-
-    // --- conventional but with an fp32 wire: removes the wire roundings, keeps
-    // the per-block dequantize. Isolates which half of the chain costs more.
-    {
-        double e = 0;
-        for (int i = 0; i < NEL; ++i) {
-            double tot = 0;
-            for (int r = 0; r < P; ++r) {
-                float a = 0.f;
-                for (int t = 0; t < S * NBLK; ++t)
-                    a += (float)dotv[r][i][t] * ldexpf(1.0f, expv[r][i][t]);
-                tot += (double)a;
-            }
-            double d = tot - S_exact[i];
-            e += d * d;
-        }
-        rows.push_back({"fp32 dequant + fp32 wire", "S*NBLK", 100.0 * sqrt(e) / sn, 4.0});
-    }
-
-    // --- integral: align every block to a common exponent and accumulate in
-    // int64. GEMM, split-K reduce and cross-rank sum are all exact integer
-    // addition; the ONLY rounding in the whole chain is the narrowing to the
-    // wire, and with an int32 wire on a shared grid there is not even that.
-    {
-        double e32 = 0, e16 = 0;
-        // One shared grid for the whole tensor, sized by the true wire max.
-        int emin = 1000;
-        for (int r = 0; r < P; ++r)
-            for (int i = 0; i < NEL; ++i)
-                for (int t = 0; t < S * NBLK; ++t) emin = std::min(emin, expv[r][i][t]);
-        double base = ldexp(1.0, emin);
-        double wmax = 0;
-        for (int i = 0; i < NEL; ++i) {
-            long long run = 0, mx = 0;
-            for (int r = 0; r < P; ++r) {
-                long long a = 0;
-                for (int t = 0; t < S * NBLK; ++t)
-                    a += dotv[r][i][t] << (expv[r][i][t] - emin);
-                run += a;
-                mx = std::max(mx, llabs(run));
-            }
-            wmax = std::max(wmax, (double)mx);
-        }
-        // int32 wire: the aligned integer is carried as-is if it fits.
-        bool fits32 = wmax <= 2147483647.0;
-        for (int i = 0; i < NEL; ++i) {
-            long long tot = 0;
-            for (int r = 0; r < P; ++r)
-                for (int t = 0; t < S * NBLK; ++t)
-                    tot += dotv[r][i][t] << (expv[r][i][t] - emin);
-            double d = (double)tot * base - S_exact[i];
-            e32 += d * d;
-        }
-        rows.push_back({fits32 ? "integral, int32 wire (exact)" : "integral, int32 wire (OVERFLOW)",
-                        "0", 100.0 * sqrt(e32) / sn, 4.0});
-        // int16 wire: one narrowing, then exact everywhere else.
-        double s16 = 32767.0 / (wmax * 1.05);
-        for (int i = 0; i < NEL; ++i) {
-            double tot = 0;
-            for (int r = 0; r < P; ++r) {
-                long long a = 0;
-                for (int t = 0; t < S * NBLK; ++t)
-                    a += dotv[r][i][t] << (expv[r][i][t] - emin);
-                double q = (double)llrint((double)a * s16);
-                tot += std::max(-32767.0, std::min(32767.0, q));
-            }
-            double d = tot / s16 * base - S_exact[i];
-            e16 += d * d;
-        }
-        rows.push_back({"integral, int16 wire", "P (source only)", 100.0 * sqrt(e16) / sn, 2.0});
-        printf("       aligned wire max %.3e, int32 %s\n", wmax, fits32 ? "sufficient" : "OVERFLOWS");
-    }
-
-    printf("\n    %-38s %18s %7s %14s\n", "chain", "roundings/output", "b/wire", "rel err (RMS)");
+    const bool fits32 = wmax <= 2147483647.0;
+    rows.push_back({fits32 ? "integral, int32 ring (exact)" : "integral, int32 ring (OVERFLOW)", "0",
+                    err_of([&](int i) {
+        long long tot = 0;
+        for (int r = 0; r < P; ++r) tot += aligned(r, i);
+        return (double)tot * base; }), 4.0});
+    const double s16 = 32767.0 / (wmax * 1.05);
+    rows.push_back({"integral, int16 ring", "P (sources)", err_of([&](int i) {
+        long long tot = 0;
+        for (int r = 0; r < P; ++r) tot += llrint((double)aligned(r, i) * s16);
+        return (double)tot / s16 * base; }), 2.0});
+    printf("       largest per-rank aligned integer %.3e (fp32 exact below 2^24 = 1.678e7)\n", pmax);
+    printf("\n    %-36s %14s %7s %14s\n", "chain", "roundings/out", "b/wire", "rel err (RMS)");
     for (auto &r : rows)
-        printf("    %-38s %18s %7.1f %13.5f%%\n", r.nm, r.rnd, r.bpw, r.err);
+        printf("    %-36s %14s %7.1f %13.5f%%\n", r.nm, r.rnd, r.bpw, r.err);
 
-    printf("\n       READ THE SECOND ROW FIRST. fp32 dequantize-and-accumulate comes\n");
-    printf("       out at EXACTLY zero error, so all %d of its nominal roundings cost\n", S * NBLK);
-    printf("       nothing and the integral chain's on-GPU advantage here is nil.\n");
-    printf("       The reason is that fp32 has a 24-bit significand and the aligned\n");
-    printf("       magnitude is %.2e, comfortably under 2^24 = 1.68e7 -- so fp32 is\n", 3.312e6);
-    printf("       holding these integers exactly and is not really floating point\n");
-    printf("       for this workload at all.\n");
-    printf("\n       So the honest claim is narrower than 'the integral chain removes\n");
-    printf("       roundings'. It removes roundings that were not happening. What it\n");
-    printf("       does remove is the bf16 narrowing and the per-hop rounding -- the\n");
-    printf("       first row against the last, 0.975%% against 0.026%%, which is the\n");
-    printf("       [13] result arriving again by a different route.\n");
-    printf("\n       Part E finds where fp32 actually breaks, which is the only place\n");
-    printf("       the integral GEMM earns its keep.\n");
-    printf("\n       Note which row is best and what it costs. An int32 wire is exact\n");
-    printf("       end to end and moves 4 bytes, which is fp32's bandwidth and throws\n");
-    printf("       away the entire point. The int16 row is the deployable one: half\n");
-    printf("       the bytes, one rounding per source, none anywhere else.\n");
-
-    // ---------------------------------------------------------------- part D
-
-    // ---------------------------------------------------------------- part E
-    printf("\n    E. where fp32 accumulation stops being exact, and integral does not\n");
-    printf("       An MXFP4 partial is an integer times a power of two, and fp32 holds\n");
-    printf("       integers exactly up to 2^24. So the entire integral-chain argument\n");
-    printf("       is worth nothing until the ALIGNED magnitude -- the value after\n");
-    printf("       every block has been shifted to a common exponent -- crosses that\n");
-    printf("       line. Sweeping depth and exponent spread to find it.\n");
-    printf("\n    %8s %8s %14s %10s %14s %14s\n",
-           "K", "spread", "aligned max", "vs 2^24", "fp32 err", "integral err");
+    printf("\n    E. where fp32 dequantize-and-accumulate stops being exact\n");
+    printf("\n    %8s %8s %16s %10s %14s\n", "K", "spread", "aligned max", "vs 2^24", "fp32 err");
     for (int Kt : {4096, 16384, 65536}) {
         for (int spread : {2, 6, 10, 14, 18}) {
-            const int NB = Kt / 32, NO = 256;
-            double e32 = 0, ei = 0, sn2 = 0, amax = 0;
+            const int NBk = Kt / 32, NO = 256;
+            double e32 = 0, sn2 = 0, amax = 0;
             for (int i = 0; i < NO; ++i) {
-                std::vector<long long> dv(NB);
-                std::vector<int> ev(NB);
-                int emin = 1000;
-                for (int t = 0; t < NB; ++t) {
-                    long long d = 0;
-                    for (int k = 0; k < 32; ++k)
-                        d += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                    dv[t] = d;
+                std::vector<long long> dv(NBk);
+                std::vector<int> ev(NBk);
+                int em = 1000;
+                for (int t = 0; t < NBk; ++t) {
+                    dv[t] = fp4_dot(32, cd);
                     ev[t] = (int)(ur(rng) * (spread + 1)) - 10;
-                    emin = std::min(emin, ev[t]);
+                    em = std::min(em, ev[t]);
                 }
-                // Exact reference: shifted integers summed in int64 (exact while
-                // under 2^63), then scaled by the common power of two.
-                long long ali = 0;
-                for (int t = 0; t < NB; ++t) ali += dv[t] << (ev[t] - emin);
-                double exact = (double)ali * ldexp(1.0, emin);
+                long long ali = 0;                        // exact while under 2^63
+                for (int t = 0; t < NBk; ++t) ali += dv[t] * (1LL << (ev[t] - em));
+                double exact = (double)ali * ldexp(1.0, em);
                 amax = std::max(amax, fabs((double)ali));
-                // fp32 dequantize-and-accumulate, as a real mainloop does it.
                 float a = 0.f;
-                for (int t = 0; t < NB; ++t) a += (float)dv[t] * ldexpf(1.0f, ev[t]);
+                for (int t = 0; t < NBk; ++t) a += (float)dv[t] * ldexpf(1.0f, ev[t]);
                 double d32 = (double)a - exact;
                 e32 += d32 * d32;
-                ei += 0.0;                    // integral is exact by construction
                 sn2 += exact * exact;
             }
-            printf("    %8d %8d %14.3e %10s %13.6f%% %13.6f%%\n", Kt, spread, amax,
-                   amax > 16777216.0 ? "OVER" : "under",
-                   100.0 * sqrt(e32) / sqrt(sn2), 100.0 * sqrt(ei) / sqrt(sn2));
+            printf("    %8d %8d %16.3e %10s %13.6f%%\n", Kt, spread, amax,
+                   amax > 16777216.0 ? "OVER" : "under", 100.0 * sqrt(e32) / sqrt(sn2));
         }
     }
-    printf("\n       The integral column is zero everywhere, by construction -- that is\n");
-    printf("       what 'exact' means and it is not a measurement. The fp32 column IS\n");
-    printf("       a measurement, and it does exactly what the theory says: dead zero\n");
-    printf("       until the aligned magnitude passes 2^24, then non-zero, with the\n");
-    printf("       crossover landing on the predicted row every time.\n");
-    printf("\n       And it does not matter. Part A measured the real exponent spread\n");
-    printf("       at 1-2 clean and 5-6 with 0.5%% of values at 20 sigma, so every\n");
-    printf("       realistic row here is one of the zeros. The spreads that break\n");
-    printf("       fp32 are 14 and 18, which this data never produces. Even there the\n");
-    printf("       error is 5e-5%% -- three orders of magnitude below what the int16\n");
-    printf("       wire costs in part C.\n");
-    printf("\n       So this is a negative result, and a fairly complete one: keeping\n");
-    printf("       the partials integral through the GEMM and the split-K reduction\n");
-    printf("       buys nothing measurable, because fp32 was already exact for this\n");
-    printf("       workload. The mechanism is real and the crossover is where it was\n");
-    printf("       predicted to be, but the crossover is outside the operating range.\n");
-    printf("\n       The end-to-end story therefore splits cleanly in two, and only\n");
-    printf("       one half is load-bearing:\n");
-    printf("         on-GPU   fp32 is already exact for realistic MXFP4 workloads,\n");
-    printf("                  so keeping the partials integral is free and buys\n");
-    printf("                  nothing measurable. What it buys is unconditional:\n");
-    printf("                  fp32's exactness holds only while K, spread and split\n");
-    printf("                  count stay under a bound nobody checks at runtime, and\n");
-    printf("                  the integral version has no bound to check. That is\n");
-    printf("                  worth having and it is not worth a paper.\n");
-    printf("         off-GPU  this is where the error is, all of it, and where every\n");
-    printf("                  measured win in this repo from [11] onward comes from.\n");
-    printf("\n    F. what this costs you in format choice\n");
-    printf("       [8] measured NVFP4 beating MXFP4 by 1.23x clean and 1.83x on\n");
-    printf("       outliers and recommended switching. NVFP4's scale is E4M3 -- it\n");
-    printf("       has a 3-bit mantissa, so the scale is NOT a power of two, so\n");
-    printf("       X_b * dot_b is not a shift and the blocks cannot be summed as\n");
-    printf("       integers. The integral chain needs MXFP4.\n");
-    printf("\n       So the two recommendations in this repo are in direct conflict,\n");
-    printf("       and which one wins depends on where your error budget is being\n");
-    printf("       spent. If the quantizer dominates, take NVFP4 and give up the\n");
-    printf("       integral chain. If the interconnect dominates -- which is the\n");
-    printf("       premise of everything from [11] onward -- take MXFP4 and keep it.\n");
-    printf("       On Blackwell, where NVFP4 is the native datapath and the emulation\n");
-    printf("       argument disappears, this gets decided for you.\n");
-    printf("\n       There is a third option this rig has not tested: an E8M0 scale\n");
-    printf("       with NVFP4's block size of 16, which keeps the shift and buys back\n");
-    printf("       some of the block-granularity half of NVFP4's advantage. That is\n");
-    printf("       not a standard format, which is a real objection to it.\n");
+    printf("    (the aligned integer path is exact by construction in every row)\n");
 }
 
 int main(int argc, char **argv) {
