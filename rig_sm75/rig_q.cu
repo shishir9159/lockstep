@@ -93,18 +93,11 @@ template <class F> static float best_of(F fn, int iters = 20) {
 // ============================================================================
 // [6] narrow -- packing versus narrowing
 // ============================================================================
-//
-// Three storage modes for the same split-K partials, same GEMM, same reduce
-// structure. The only variable is how many bytes a partial costs and whether
-// the two microbatches share a word.
-//
-//   mode 0  int32 x2   two int32 arrays          8 bytes / output / split
-//   mode 1  int16 x2   two int16 arrays          4 bytes / output / split
-//   mode 2  packed     one int32, two int16      4 bytes / output / split
-//
-// Mode 1 is the control. It is legal for exactly the same reason mode 2 is --
-// a depth-d split of FP4 data has |partial| <= 144*d, so d <= 227 fits int16 --
-// but it does no bit arithmetic at all.
+// Same split-K GEMM, three storage modes for the partials:
+//   0  int32 x2  two int32 arrays   8 B / output / split
+//   1  int16 x2  two int16 arrays   4 B   (the control: narrowing only)
+//   2  packed    one int32 word     4 B   (narrowing + pairing)
+// int16 is exact for split depth d <= 227, since |partial| <= 144*d.
 #define QTS 16
 #define QTK 16
 #define QPAD 4
@@ -141,13 +134,13 @@ __global__ __launch_bounds__(QTS * QTS) void nw_gemm(
     }
     const size_t MN = (size_t)M * N;
     const size_t i = (size_t)row * N + col;
-    if (MODE == 0) {                                     // 8 bytes
+    if (MODE == 0) {
         p32[((size_t)split * 2) * MN + i] = acc1;
         p32[((size_t)split * 2 + 1) * MN + i] = acc2;
-    } else if (MODE == 1) {                              // 4 bytes, no packing
+    } else if (MODE == 1) {
         p16a[(size_t)split * MN + i] = (short)acc1;
         p16b[(size_t)split * MN + i] = (short)acc2;
-    } else {                                             // 4 bytes, packed pair
+    } else {
         unsigned p = ((unsigned)(acc2 & 0xFFFF) << 16) | (unsigned)(acc1 & 0xFFFF);
         ppk[(size_t)split * MN + i] = (int)p;
     }
@@ -179,7 +172,7 @@ __global__ void nw_redpk(const int *__restrict__ p, int *c1, int *c2, size_t MN,
     int a = 0, b = 0;
     for (int s = 0; s < S; ++s) {
         unsigned v = (unsigned)p[(size_t)s * MN + i];
-        a += (int)(short)(v & 0xFFFF);            // unpack, THEN sum
+        a += (int)(short)(v & 0xFFFF);            // unpack, then sum
         b += (int)(short)(v >> 16);
     }
     c1[i] = a; c2[i] = b;
@@ -187,9 +180,7 @@ __global__ void nw_redpk(const int *__restrict__ p, int *c1, int *c2, size_t MN,
 static void exp_narrow() {
     const int M = 256, N = 256, K = 8192;
     const size_t MN = (size_t)M * N;
-    printf("\n[6] packing or narrowing? the control experiment [5] was missing\n");
-    printf("    M=%d N=%d K=%d. int32x2 is 8 B/output/split; BOTH int16 rows are 4 B.\n", M, N, K);
-    printf("    If int16x2 ties packed, the win is narrowing and the bit trick is noise.\n");
+    printf("\n[6] split-K partials: packing or narrowing?  M=%d N=%d K=%d\n", M, N, K);
     std::uniform_int_distribution<int> cd(0, 14);
     std::vector<signed char> hA1((size_t)M * K), hA2((size_t)M * K), hBt((size_t)N * K);
     for (auto &v : hA1) v = (signed char)e2m1_q(LEGAL[cd(rng)]);
@@ -223,19 +214,6 @@ static void exp_narrow() {
     CHECK(cudaMalloc(&ppk, MN * 4 * SMAX));
     CHECK(cudaMalloc(&p16a, MN * 2 * SMAX));
     CHECK(cudaMalloc(&p16b, MN * 2 * SMAX));
-    Timer tm;
-    const int iters = 20;
-    auto best_of = [&](auto fn) {
-        fn(); CHECK(cudaDeviceSynchronize());
-        float best = 1e30f;
-        for (int r = 0; r < 5; ++r) {
-            tm.start();
-            for (int i = 0; i < iters; ++i) fn();
-            float ms = tm.stop() / iters;
-            best = std::min(best, ms);
-        }
-        return best;
-    };
     auto verify = [&]() {
         std::vector<int> h1(MN), h2(MN);
         CHECK(cudaMemcpy(h1.data(), c1, MN * 4, cudaMemcpyDeviceToHost));
@@ -249,6 +227,9 @@ static void exp_narrow() {
     };
     dim3 blk(QTS, QTS);
     const unsigned rg = (unsigned)((MN + 255) / 256);
+    const char *nm[3] = {"int32 x2", "int16 x2", "packed"};
+    float red[3] = {0, 0, 0};
+    int Slast = 0;
     printf("\n    %4s %5s  %-9s %9s %10s %10s %8s  %s\n",
            "S", "depth", "mode", "gemm ms", "reduce ms", "total ms", "vs int32", "check");
     for (int S : {64, 128, 256}) {
@@ -256,63 +237,46 @@ static void exp_narrow() {
         dim3 grd((unsigned)(N / QTS), (unsigned)(M / QTS), (unsigned)S);
         float tot0 = 0.f;
         for (int mode = 0; mode < 3; ++mode) {
-            float g, r;
-            if (mode == 0) {
-                g = best_of([&] { nw_gemm<0><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S); });
-                r = best_of([&] { nw_red32<<<rg, 256>>>(p32, c1, c2, MN, S); });
-                nw_gemm<0><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
-                nw_red32<<<rg, 256>>>(p32, c1, c2, MN, S);
-            } else if (mode == 1) {
-                g = best_of([&] { nw_gemm<1><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S); });
-                r = best_of([&] { nw_red16<<<rg, 256>>>(p16a, p16b, c1, c2, MN, S); });
-                nw_gemm<1><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
-                nw_red16<<<rg, 256>>>(p16a, p16b, c1, c2, MN, S);
-            } else {
-                g = best_of([&] { nw_gemm<2><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S); });
-                r = best_of([&] { nw_redpk<<<rg, 256>>>(ppk, c1, c2, MN, S); });
-                nw_gemm<2><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
-                nw_redpk<<<rg, 256>>>(ppk, c1, c2, MN, S);
-            }
+            auto gemm = [&] {
+                if (mode == 0) nw_gemm<0><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
+                else if (mode == 1) nw_gemm<1><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
+                else nw_gemm<2><<<grd, blk>>>(A1, A2, Bt, p32, p16a, p16b, ppk, M, N, K, S);
+            };
+            auto reduce = [&] {
+                if (mode == 0) nw_red32<<<rg, 256>>>(p32, c1, c2, MN, S);
+                else if (mode == 1) nw_red16<<<rg, 256>>>(p16a, p16b, c1, c2, MN, S);
+                else nw_redpk<<<rg, 256>>>(ppk, c1, c2, MN, S);
+            };
+            float g = best_of(gemm), r = best_of(reduce);
+            gemm();
+            reduce();
             CHECK(cudaDeviceSynchronize());
             size_t bad = verify();
             float tot = g + r;
             if (mode == 0) tot0 = tot;
-            const char *nm[3] = {"int32 x2", "int16 x2", "packed"};
+            red[mode] = r;
             if (mode == 0) printf("    %4d %5d  %-9s %9.3f %10.3f %10.3f %8s  %s\n",
                                   S, d, nm[mode], g, r, tot, "-", bad ? "WRONG" : "exact");
             else printf("    %4s %5s  %-9s %9.3f %10.3f %10.3f %7.2fx  %s\n",
                         "", "", nm[mode], g, r, tot, tot0 / tot, bad ? "WRONG" : "exact");
         }
+        Slast = S;
     }
-    printf("\n    Both int16 rows move the same bytes. Any gap between them is the\n");
-    printf("    pairing alone -- one 32-bit store against two 16-bit stores, and one\n");
-    printf("    load stream against two in the reduce. Any gap between int32x2 and\n");
-    printf("    them is the narrowing, which is what the 144*d bound actually buys.\n");
+    printf("\n    reduce at S=%d: narrowing (int32x2 -> int16x2) %.2fx, pairing (int16x2 -> packed) %.2fx\n",
+           Slast, red[0] / red[1], red[1] / red[2]);
     cudaFree(A1); cudaFree(A2); cudaFree(Bt);
     cudaFree(c1); cudaFree(c2); cudaFree(p32); cudaFree(ppk);
     cudaFree(p16a); cudaFree(p16b);
 }
+
 // ============================================================================
-// [7] int8acc -- the only Hopper datapath with a wide enough accumulator
+// [7] int8acc -- accumulator versus operand
 // ============================================================================
-//
-// Two questions that experiment [2] ran together:
-//
-//   ACCUMULATOR. Can a slot layout [C1 : p][C2 : p] live in the accumulator?
-//   Needs 2*p-1 bits. INT8 MMA on Hopper accumulates in true s32, against
-//   fp32's 24 significand bits and the FP8 path's ~14. So s32 should carry it
-//   much further than anything else on the chip.
-//
-//   OPERAND. Can Ahat = A1 + 2^p*A2 live in one int8 lane? |q| <= 12 needs 5
-//   signed bits, so 12 + 12*2^p <= 127 caps p at 3. But the slots must not
-//   collide, which needs p >= bits(144K) + 1 -- 14 at K=32.
-//
-// If the accumulator column is fine and the operand column is not, then the
-// operand lane is the wall, and it is the same wall on every Hopper format.
+// ACCUMULATOR: can [C1 : p][C2 : p] live in s32, fp32 (24 bits) or the ~14-bit
+// FP8 path? OPERAND: can Ahat = A1 + 2^p*A2 live in one int8 lane? |q| <= 12
+// caps p at 3, while the slots need p >= bits(144K) + 1.
 static void exp_int8acc() {
-    printf("\n[7] INT8 / s32: is the accumulator the problem, or the operand?\n");
-    printf("    Hopper tensor-core formats stop at INT8 (Ampere's s4 and b1 are gone),\n");
-    printf("    and INT8 is the only one that accumulates in a true 32-bit integer.\n");
+    printf("\n[7] INT8/s32: is the accumulator the wall, or the operand?\n");
     const int TRIALS = 4000;
     std::uniform_int_distribution<int> cd(0, 14);
     printf("\n    %5s %5s %6s | %-37s | %-22s\n", "K", "p", "need",
@@ -323,39 +287,33 @@ static void exp_int8acc() {
         const int p = slot_offset(K);
         const int need = packed_bits_needed(K);
         long long ok32 = 0, ok24 = 0, ok14 = 0, okOp = 0;
-        // int8 lane: |q1 + 2^pl*q2| <= 12 + 12*2^pl <= 127  ->  pl <= 3
-        int plmax = 0;
+        int plmax = 0;                              // 12 + 12*2^pl <= 127
         while (12 + 12 * (1 << (plmax + 1)) <= 127) ++plmax;
         for (int t = 0; t < TRIALS; ++t) {
-            long long C1 = 0, C2 = 0;
-            long long accOp = 0;
+            long long C1 = 0, C2 = 0, accOp = 0;
             for (int k = 0; k < K; ++k) {
                 int q1 = e2m1_q(LEGAL[cd(rng)]);
                 int q2 = e2m1_q(LEGAL[cd(rng)]);
                 int b  = e2m1_q(LEGAL[cd(rng)]);
                 C1 += (long long)q1 * b;
                 C2 += (long long)q2 * b;
-                int ahat = q1 + (q2 << plmax);          // fits int8 by construction
-                accOp += (long long)ahat * b;
+                accOp += (long long)(q1 + q2 * (1 << plmax)) * b;
             }
-            // --- accumulator side: two exact chains, combined once at the end.
-            long long comb = C1 + (C2 << p);
-            // s32: wraps at 2^31. Exact iff the layout fits.
-            int wrapped = (int)(unsigned long long)comb;
+            // Accumulator side: two exact chains combined once at the end.
+            long long comb = C1 + C2 * (1LL << p);
+            int wrapped = (int)(unsigned long long)comb;          // s32 wraps at 2^31
             long long g2 = ((long long)wrapped + (1LL << (p - 1))) >> p;
-            long long g1 = (long long)wrapped - (g2 << p);
+            long long g1 = (long long)wrapped - g2 * (1LL << p);
             if (g1 == C1 && g2 == C2) ++ok32;
-            // fp32 / fp8: same layout through a W-bit significand.
-            for (int wi = 0; wi < 2; ++wi) {
-                int drop = wi == 0 ? 0 : 10;            // W = 24 and W = 14
-                float f = round_sig((float)comb, drop);
+            for (int wi = 0; wi < 2; ++wi) {                      // W = 24, then 14
+                float f = round_sig((float)comb, wi == 0 ? 0 : 10);
                 long long h2 = (long long)llrintf(f / (float)(1LL << p));
-                long long h1 = (long long)llrintf(f) - (h2 << p);
+                long long h1 = (long long)llrintf(f) - h2 * (1LL << p);
                 if (h1 == C1 && h2 == C2) { if (wi == 0) ++ok24; else ++ok14; }
             }
-            // --- operand side: one lane, the largest offset int8 permits.
+            // Operand side: one lane, the largest offset int8 permits.
             long long o2 = (accOp + (1LL << (plmax - 1))) >> plmax;
-            long long o1 = accOp - (o2 << plmax);
+            long long o1 = accOp - o2 * (1LL << plmax);
             if (o1 == C1 && o2 == C2) ++okOp;
         }
         printf("    %5d %5d %6d | %7s %7.1f%% %7.1f%% %8.1f%% | %6d %6d %7.1f%%\n",
@@ -363,35 +321,13 @@ static void exp_int8acc() {
                100.0 * ok32 / TRIALS, 100.0 * ok24 / TRIALS, 100.0 * ok14 / TRIALS,
                plmax, p - plmax, 100.0 * okOp / TRIALS);
     }
-    printf("\n    's32 wc' is the WORST CASE: safe only while need <= 32. 's32 obs' is\n");
-    printf("    what random FP4 data actually did, and it stays at 100%% past the point\n");
-    printf("    the bound gives out, for the same reason the OVERFL row in [5] still\n");
-    printf("    verified -- a random walk lands near sqrt(K), nowhere near 144*K. Do\n");
-    printf("    not read the observed column as a guarantee.\n");
-    printf("\n    The two accumulator families fail differently, and that is the finding.\n");
-    printf("    fp32 fails on SIGNIFICAND: 24 bits, so the low bits of C1 are gone even\n");
-    printf("    when the magnitude is tiny -- which is why its column decays smoothly\n");
-    printf("    with K on ordinary data. s32 has no significand at all, only range, and\n");
-    printf("    range is the resource this data does not spend. An integer accumulator\n");
-    printf("    is strictly the better container for a packed layout.\n");
-    printf("\n    It still does not rescue the scheme, because the wall is elsewhere.\n");
-    printf("    'p max' is the largest offset an int8 lane can hold; 'short' is how many\n");
-    printf("    bits of separation the layout still needs after that. The value needs 5\n");
-    printf("    bits and the separation needs ~14 more, and no Hopper operand lane has\n");
-    printf("    19 -- e4m3 has 4 significand bits, bf16 and int8 have 8, fp16 has 11.\n");
-    printf("    The operand column is chance, not arithmetic.\n");
-    printf("\n    So: the accumulator was never the binding constraint, the operand was,\n");
-    printf("    and no format on this chip fixes it. Read the s32 column as good news\n");
-    printf("    for the TRANSPORT form instead -- combining at store time is exactly\n");
-    printf("    what [5] and [6] do, and it is exact because nothing is ever multiplied\n");
-    printf("    while packed.\n");
+    printf("\n    's32 wc' is the worst-case bound; 's32 obs' is random data and is not a\n");
+    printf("    guarantee. 'short' = separation bits the operand lane still lacks.\n");
 }
+
 // ============================================================================
-// [8] / [9] block-scaled format comparison
+// [8] / [9] block-scaled formats against an fp64 reference
 // ============================================================================
-//
-// Same GEMM, same data, four formats. The reference is fp64 on the unquantized
-// values, so what we measure is purely the format's own error.
 enum Fmt { F_MXFP4, F_NVFP4, F_MXFP8, F_BF16 };
 struct FmtInfo { const char *name; int block; const char *scale; double bits; };
 static FmtInfo fmt_info(Fmt f) {
@@ -402,7 +338,6 @@ static FmtInfo fmt_info(Fmt f) {
         default:      return {"BF16",   0, "-",    16.0};
     }
 }
-// Quantize one length-K vector in place, block by block.
 static void quantize_vec(std::vector<double> &v, Fmt f) {
     const int K = (int)v.size();
     if (f == F_BF16) {
@@ -434,12 +369,11 @@ static void fmt_table(const char *title, bool outliers, const std::vector<Fmt> &
     auto fill = [&](std::vector<double> &v) {
         for (auto &x : v) {
             x = nd(rng);
-            if (outliers && ud(rng) < 0.01) x *= 20.0;   // 1% heavy tail
+            if (outliers && ud(rng) < 0.01) x *= 20.0;
         }
     };
     fill(A); fill(B);
-    // fp64 reference, B stored transposed (N x K).
-    std::vector<double> Cref((size_t)M * N, 0.0);
+    std::vector<double> Cref((size_t)M * N, 0.0);          // B stored N x K
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) {
             double a = 0;
@@ -454,16 +388,15 @@ static void fmt_table(const char *title, bool outliers, const std::vector<Fmt> &
            "format", "block", "scale", "bit/elem", "blk bits", "rel err", "max abs err");
     for (Fmt f : fmts) {
         std::vector<double> Aq = A, Bq = B;
-        for (int m = 0; m < M; ++m) {
-            std::vector<double> r(Aq.begin() + (size_t)m * K, Aq.begin() + (size_t)(m + 1) * K);
-            quantize_vec(r, f);
-            std::copy(r.begin(), r.end(), Aq.begin() + (size_t)m * K);
-        }
-        for (int n = 0; n < N; ++n) {
-            std::vector<double> r(Bq.begin() + (size_t)n * K, Bq.begin() + (size_t)(n + 1) * K);
-            quantize_vec(r, f);
-            std::copy(r.begin(), r.end(), Bq.begin() + (size_t)n * K);
-        }
+        auto qrows = [&](std::vector<double> &X, int rows) {
+            for (int m = 0; m < rows; ++m) {
+                std::vector<double> r(X.begin() + (size_t)m * K, X.begin() + (size_t)(m + 1) * K);
+                quantize_vec(r, f);
+                std::copy(r.begin(), r.end(), X.begin() + (size_t)m * K);
+            }
+        };
+        qrows(Aq, M);
+        qrows(Bq, N);
         double e2 = 0, emax = 0;
         for (int m = 0; m < M; ++m)
             for (int n = 0; n < N; ++n) {
@@ -480,51 +413,28 @@ static void fmt_table(const char *title, bool outliers, const std::vector<Fmt> &
         else
             snprintf(blkbits, sizeof blkbits, "n/a");
         printf("    %-7s %6d %7s %9.2f %9s %10.2e%% %11.3e\n",
-               fi.name, fi.block ? fi.block : 0, fi.scale, fi.bits, blkbits,
-               100.0 * sqrt(e2) / refn, emax);
+               fi.name, fi.block, fi.scale, fi.bits, blkbits, 100.0 * sqrt(e2) / refn, emax);
     }
 }
 static void exp_nvfp4() {
     printf("\n[8] MXFP4 (block 32, E8M0) vs NVFP4 (block 16, E4M3)\n");
-    printf("    Two axes move at once: block size and scale format. The scale format\n");
-    printf("    is the bigger one -- E8M0 is a bare power of two, so it discards up\n");
-    printf("    to 2x of the block's range before any element is rounded.\n");
-    printf("    M=N=48, K=512, fp64 reference. 'blk bits' is 1+bits(144*block), the\n");
-    printf("    accumulator width an exact block dot product needs.\n");
+    printf("    M=N=48, K=512, fp64 reference; 'blk bits' = 1 + bits(144*block).\n");
     std::vector<Fmt> f = {F_MXFP4, F_NVFP4};
     fmt_table("clean data, N(0,1):", false, f);
-    fmt_table("1% outliers at 20 sigma (the case block size exists for):", true, f);
-    printf("\n    On Hopper both are emulated the same way and cost the same FLOPs, so\n");
-    printf("    the extra 0.25 bit/elem of NVFP4 is the entire price. It is also the\n");
-    printf("    format Blackwell runs natively, which makes it the forward-compatible\n");
-    printf("    choice even where the accuracy gap is small.\n");
+    fmt_table("1% outliers at 20 sigma:", true, f);
 }
 static void exp_mxfp8() {
-    printf("\n[9] MXFP4 vs MXFP8 -- what does the 4-bit format actually buy on Hopper?\n");
-    printf("    MXFP4 has to be expanded to E4M3 to reach the tensor core, so it runs\n");
-    printf("    at the FP8 rate at best (1979 TFLOP/s dense) and pays an unpack on\n");
-    printf("    top. MXFP8 runs there natively with no unpack at all.\n");
+    printf("\n[9] what does 4-bit buy on Hopper, where MXFP4 runs at the FP8 rate?\n");
     std::vector<Fmt> f = {F_MXFP4, F_NVFP4, F_MXFP8, F_BF16};
     fmt_table("clean data, N(0,1):", false, f);
     fmt_table("1% outliers at 20 sigma:", true, f);
-    printf("\n    Same FLOPs, roughly half the bytes, more error. So on Hopper the\n");
-    printf("    4-bit formats buy memory, bandwidth and interconnect -- never FLOPs.\n");
-    printf("    That is the whole argument for [11]: if the only thing FP4 buys is\n");
-    printf("    bytes, the payoff has to be collected where bytes are expensive, and\n");
-    printf("    nothing on a node is more expensive per byte than the link.\n");
 }
+
 // ============================================================================
 // [10] interleave -- one load stream for two microbatches
 // ============================================================================
-//
-// SEP: A1 and A2 are separate arrays, each nibble-packed 2 elements per byte
-//      along K. A tile needs one 4-byte load from each.
-// ILV: one array, byte k holds A1[k] in the low nibble and A2[k] in the high.
-//      A tile needs two 4-byte loads from one array.
-//
-// IDENTICAL byte count -- FP4 is already 2 elements per byte either way. This
-// is a locality and stream-count test. If it wins, it wins on cache behaviour,
-// not on bandwidth, and it must not be reported as the latter.
+// SEP: A1 and A2 are separate nibble-packed arrays. ILV: one array, byte k holds
+// A1[k] low and A2[k] high. Same bytes, same load count: a locality test only.
 #define IL_TS 16
 #define IL_TK 64
 #define IL_PAD 4
@@ -533,7 +443,7 @@ __device__ __forceinline__ int q4(int code) {
     int v = t[code & 7];
     return (code & 8) ? -v : v;
 }
-// SEP: each thread pulls one 32-bit word = 8 consecutive k of one matrix.
+// SEP: each thread loads one 32-bit word = 8 consecutive k of one matrix.
 __global__ __launch_bounds__(IL_TS * IL_TS) void il_sep(
         const uint32_t *__restrict__ A1p, const uint32_t *__restrict__ A2p,
         const signed char *__restrict__ Bt, int *__restrict__ C1, int *__restrict__ C2,
@@ -544,14 +454,12 @@ __global__ __launch_bounds__(IL_TS * IL_TS) void il_sep(
     const int row = blockIdx.y * IL_TS + threadIdx.y;
     const int col = blockIdx.x * IL_TS + threadIdx.x;
     const int tid = threadIdx.y * IL_TS + threadIdx.x;        // 0..255
-    const int wpr = IL_TK / 8;                                // words per row = 8
+    const int wpr = IL_TK / 8;                                // 8 words per row
     const int half = tid >> 7;                                // 0 -> A1, 1 -> A2
-    const int lr = (tid & 127) / wpr, lw = (tid & 127) % wpr; // 16 rows x 8 words
+    const int lr = (tid & 127) / wpr, lw = (tid & 127) % wpr;
     const int K8 = K / 8;
     int acc1 = 0, acc2 = 0;
     for (int t = 0; t < K; t += IL_TK) {
-        // All 256 threads load one word each: half from A1, half from A2, so the
-        // two layouts issue the same number of loads from the same thread count.
         {
             const uint32_t *src = half ? A2p : A1p;
             uint32_t w = src[(size_t)(blockIdx.y * IL_TS + lr) * K8 + (t / 8) + lw];
@@ -577,7 +485,7 @@ __global__ __launch_bounds__(IL_TS * IL_TS) void il_sep(
     C1[(size_t)row * N + col] = acc1;
     C2[(size_t)row * N + col] = acc2;
 }
-// ILV: each thread pulls one 32-bit word = 4 consecutive k of BOTH matrices.
+// ILV: each thread loads one 32-bit word = 4 consecutive k of BOTH matrices.
 __global__ __launch_bounds__(IL_TS * IL_TS) void il_ilv(
         const uint32_t *__restrict__ Ai,
         const signed char *__restrict__ Bt, int *__restrict__ C1, int *__restrict__ C2,
@@ -589,7 +497,7 @@ __global__ __launch_bounds__(IL_TS * IL_TS) void il_ilv(
     const int col = blockIdx.x * IL_TS + threadIdx.x;
     const int tid = threadIdx.y * IL_TS + threadIdx.x;
     const int wpr = IL_TK / 4;                                // 16 words per row
-    const int lr = tid / wpr, lw = tid % wpr;                 // exactly 16 rows
+    const int lr = tid / wpr, lw = tid % wpr;
     const int K4 = K / 4;
     int acc1 = 0, acc2 = 0;
     for (int t = 0; t < K; t += IL_TK) {
@@ -620,10 +528,7 @@ __global__ __launch_bounds__(IL_TS * IL_TS) void il_ilv(
 }
 static void exp_interleave() {
     const int M = 512, N = 512, K = 4096;
-    printf("\n[10] nibble-interleaved A1/A2: one load stream for two microbatches\n");
-    printf("    M=%d N=%d K=%d. SEP reads two FP4 arrays; ILV reads one array whose\n", M, N, K);
-    printf("    every byte carries A1[k] low and A2[k] high. Same bytes, same load\n");
-    printf("    count, same dp4a work. Only the number of streams differs.\n");
+    printf("\n[10] nibble-interleaved A1/A2, M=%d N=%d K=%d (equal bytes: locality only)\n", M, N, K);
     std::uniform_int_distribution<int> cd(0, 14);
     std::vector<uint8_t> c1v((size_t)M * K), c2v((size_t)M * K);
     for (auto &v : c1v) v = (uint8_t)LEGAL[cd(rng)];
@@ -655,19 +560,8 @@ static void exp_interleave() {
     CHECK(cudaMemcpy(dAi, ilv.data(), ilv.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dBt, hBt.data(), hBt.size(), cudaMemcpyHostToDevice));
     dim3 blk(IL_TS, IL_TS), grd((unsigned)(N / IL_TS), (unsigned)(M / IL_TS));
-    Timer tm;
-    auto best_of = [&](auto fn) {
-        fn(); CHECK(cudaDeviceSynchronize());
-        float best = 1e30f;
-        for (int r = 0; r < 5; ++r) {
-            tm.start();
-            for (int i = 0; i < 10; ++i) fn();
-            best = std::min(best, tm.stop() / 10);
-        }
-        return best;
-    };
-    float ts = best_of([&] { il_sep<<<grd, blk>>>(dA1, dA2, dBt, dC1, dC2, M, N, K); });
-    float ti = best_of([&] { il_ilv<<<grd, blk>>>(dAi, dBt, eC1, eC2, M, N, K); });
+    float ts = best_of([&] { il_sep<<<grd, blk>>>(dA1, dA2, dBt, dC1, dC2, M, N, K); }, 10);
+    float ti = best_of([&] { il_ilv<<<grd, blk>>>(dAi, dBt, eC1, eC2, M, N, K); }, 10);
     CHECK(cudaDeviceSynchronize());
     std::vector<int> h1((size_t)M * N), h2((size_t)M * N), g1((size_t)M * N), g2((size_t)M * N);
     CHECK(cudaMemcpy(h1.data(), dC1, h1.size() * 4, cudaMemcpyDeviceToHost));
@@ -684,10 +578,10 @@ static void exp_interleave() {
            flop / ti * 1e-6, ts / ti);
     printf("    agreement: %s (%zu of %zu outputs differ)\n",
            bad ? "MISMATCH" : "identical", bad, h1.size());
-    printf("\n    Byte counts are equal by construction, so whatever this shows is\n");
-    printf("    locality, not bandwidth. FP4 is already two elements per byte; there\n");
-    printf("    is no second densification to collect on the operand side.\n");
+    cudaFree(dA1); cudaFree(dA2); cudaFree(dAi); cudaFree(dBt);
+    cudaFree(dC1); cudaFree(dC2); cudaFree(eC1); cudaFree(eC2);
 }
+
 // ============================================================================
 // [11] link -- measured off-chip bandwidth, and what a byte costs on a link
 // ============================================================================
@@ -727,34 +621,20 @@ static void exp_link() {
 // ============================================================================
 // [12] dense -- normalization-aware packing
 // ============================================================================
-//
-// The idea: if the reduced result gets normalized anyway, a partial does not
-// have to be exactly recoverable. It has to be good enough AFTER the sum. So:
-//
-//   * how many bits does the a-priori bound 144*d demand,
-//   * how many does the data actually use,
-//   * what does an exception path cost if you size for the data and escape the
-//     rare overflow,
-//   * and what does an MX-style shared exponent over a group of partials give,
-//     which is a larger container holding more quantized partials -- exactly
-//     the "denser packing in a bigger slot" shape.
+// If the reduced result is normalized anyway, a partial only has to survive the
+// SUM. Compares the a-priori bound with measured ranges, an escape-list
+// exception path, and MX-style groups sharing one E8M0 exponent.
 static void exp_dense() {
     printf("\n[12] normalization-aware packing: how dense can a partial get?\n");
-    printf("    A depth-d partial is an integer with |p| <= 144*d. That bound is free\n");
-    printf("    but loose -- real data is a random walk, so it lands near sqrt(d).\n");
     const int TRIALS = 20000;
     std::uniform_int_distribution<int> cd(0, 14);
     printf("\n    %5s %8s %8s %10s %9s %9s %11s\n", "depth", "a-priori", "measured",
            "typ |p|", "w=12 ovf", "w=10 ovf", "w=8 ovf");
     for (int d : {16, 32, 64, 128, 227}) {
-        long long mx = 0;
+        long long mx = 0, o12 = 0, o10 = 0, o8 = 0;
         double sum = 0;
-        long long o12 = 0, o10 = 0, o8 = 0;
         for (int t = 0; t < TRIALS; ++t) {
-            long long a = 0;
-            for (int k = 0; k < d; ++k)
-                a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-            long long m = llabs(a);
+            long long m = llabs(fp4_dot(d, cd));
             mx = std::max(mx, m);
             sum += (double)m;
             if (m >= (1LL << 11)) ++o12;
@@ -765,58 +645,36 @@ static void exp_dense() {
                d, bits_of((long long)FP4_PMAX * d) + 1, bits_of(mx) + 1, sum / TRIALS,
                100.0 * o12 / TRIALS, 100.0 * o10 / TRIALS, 100.0 * o8 / TRIALS);
     }
-    printf("\n    'a-priori' is what the bound demands and always holds. 'measured' is\n");
-    printf("    what %d random partials actually needed. The gap is 3-5 bits, which is\n", TRIALS);
-    printf("    the headroom an exception path can sell you -- and the reason the\n");
-    printf("    OVERFL row in [5] still verified exact.\n");
-    // --- exception path: size for the data, escape the rare overflow.
-    printf("\n    exception path: w-bit payload plus an escape list for the overflows\n");
+    printf("\n    exception path: w-bit payload + escape list (index + int32 = 6 B each)\n");
     printf("    %5s %5s %11s %13s %11s\n", "depth", "w", "escape rate", "eff bytes/p", "vs int16");
     for (int d : {32, 128}) {
         for (int w : {12, 10, 8}) {
             long long esc = 0;
-            for (int t = 0; t < TRIALS; ++t) {
-                long long a = 0;
-                for (int k = 0; k < d; ++k)
-                    a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                if (llabs(a) >= (1LL << (w - 1))) ++esc;
-            }
+            for (int t = 0; t < TRIALS; ++t)
+                if (llabs(fp4_dot(d, cd)) >= (1LL << (w - 1))) ++esc;
             double rate = (double)esc / TRIALS;
-            double eff = w / 8.0 + rate * 6.0;      // escape carries index + int32
+            double eff = w / 8.0 + rate * 6.0;
             printf("    %5d %5d %10.3f%% %13.3f %10.2fx\n", d, w, 100.0 * rate, eff, 2.0 / eff);
         }
     }
-    printf("    An escape costs an index plus a full-width value, so a rate above a\n");
-    printf("    few percent eats the win. Exact, but only worth it where the payload\n");
-    printf("    width sits just above the measured range.\n");
-    // --- MX-style partials: a bigger container holding more quantized partials.
-    printf("\n    MX-style partials: G partials share one E8M0 exponent, w-bit mantissa\n");
-    printf("    (this is the 'larger data type, more quantized data packed' shape)\n");
+    printf("\n    MX-style partials: G partials share one E8M0 exponent (rounded UP), w-bit mantissa\n");
     printf("    %5s %5s %5s %13s %14s %11s\n", "depth", "G", "w", "bytes/partial", "rel err of sum", "vs int16");
     for (int d : {32, 128}) {
         for (int G : {8, 32}) {
             for (int w : {8, 6, 4}) {
                 double e2 = 0, s2 = 0;
                 const int GROUPS = 400;
+                const long long lim = (1LL << (w - 1)) - 1;
                 for (int t = 0; t < GROUPS; ++t) {
                     std::vector<long long> p(G);
-                    for (int j = 0; j < G; ++j) {
-                        long long a = 0;
-                        for (int k = 0; k < d; ++k)
-                            a += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-                        p[j] = a;
-                    }
+                    for (int j = 0; j < G; ++j) p[j] = fp4_dot(d, cd);
                     double amax = 0;
                     for (int j = 0; j < G; ++j) amax = std::max(amax, fabs((double)p[j]));
-                    // Shared exponent rounded UP, so nothing in the group clamps.
-                    double sc = amax > 0 ? quant_e8m0_up((float)(amax / ((1 << (w - 1)) - 1))) : 1.0;
+                    double sc = amax > 0 ? quant_e8m0_up((float)(amax / lim)) : 1.0;
                     long long exact = 0, approx = 0;
                     for (int j = 0; j < G; ++j) {
                         exact += p[j];
-                        long long q = llrint((double)p[j] / sc);
-                        long long lim = (1LL << (w - 1)) - 1;
-                        q = std::max(-lim, std::min(lim, q));
-                        approx += q;
+                        approx += std::max(-lim, std::min(lim, (long long)llrint((double)p[j] / sc)));
                     }
                     double da = (double)approx * sc - (double)exact;
                     e2 += da * da;
@@ -828,24 +686,8 @@ static void exp_dense() {
             }
         }
     }
-    printf("\n    Error falls ~4x per 2 mantissa bits, as it should, and barely moves\n");
-    printf("    with G. Two effects cancel: a bigger group has a bigger amax, so the\n");
-    printf("    shared grid is coarser, but its rounding errors are independent and\n");
-    printf("    partly cancel in the sum. Since G is nearly free on accuracy, pick it\n");
-    printf("    large to amortize the one scale byte -- G=32 costs 1/32 byte/partial.\n");
-    printf("\n    That is the whole argument for normalization-aware packing: you are not\n");
-    printf("    protecting a partial, you are protecting a sum, and the sum is more\n");
-    printf("    forgiving than any single term in it.\n");
-    printf("\n    Best cell above is w=8, G=32: 1.03 bytes/partial, ~2x denser than int16,\n");
-    printf("    for under 1%% error on the reduced value. w=4 is 3.8x denser and ~14%%,\n");
-    printf("    which is too coarse for a gradient but not obviously too coarse for an\n");
-    printf("    activation that a layernorm is about to rescale anyway.\n");
-    printf("\n    The trade against int16 is stark and worth stating plainly: int16 with\n");
-    printf("    the 144*d bound is EXACT, needs no amax pass, and needs no second pass\n");
-    printf("    over the partials. Everything denser here is approximate and needs both.\n");
-    printf("    Pick by whether the consumer normalizes.\n");
 }
-// ============================================================================
+
 // ============================================================================
 // [13] fair -- all-reduce at equal bytes: what closure and bits are each worth
 // ============================================================================
@@ -1000,51 +842,26 @@ static void exp_fair() {
 }
 
 // ============================================================================
-// [14] llm -- does any of this survive at 1B+ parameters?
+// [14] llm -- 1B+ parameters
 // ============================================================================
-//
-// Everything so far ran at NEL=2048-4096 elements, K=256, P<=128. A 1B model
-// all-reduces 1e9 elements per step with K in the thousands over hundreds of
-// ranks, and three things get worse in that direction at once:
-//
-//   A. The a-priori 144*K*P bound loosens as K*P grows while the actual amax
-//      only grows as sqrt(K*P). Every doubling of K*P throws away half a bit.
-//      This part is arithmetic and it is not kind to the a-priori story.
-//
-//   B. amax over 1e9 elements is a max over 1e9 samples, so a single global
-//      scale is set by the most extreme value in the entire tensor. Gradient
-//      tensors have heavy tails. This is the failure mode that actually bites.
-//
-//   C. The scales themselves have to be agreed across ranks BEFORE the payload
-//      moves, or the grids do not line up and closure is lost. That is a second
-//      collective. It has to be cheap enough to be worth it.
-//
-// Part A uses a Gaussian surrogate for the per-rank contribution rather than
-// running the K-deep contraction directly -- at K=16384 and P=1024 the direct
-// loop is 1e11 multiply-adds. The surrogate is validated against the real thing
-// at K=256 in the first table, and it is exact in distribution: a K-deep dot
-// product of independent E2M1 codes is a sum of K iid mean-zero terms, so it is
-// Gaussian with variance K*E[q^2]^2, rounded to an integer.
+// A: the a-priori 144*K*P bound against the measured range, using a Gaussian
+//    surrogate for the per-rank contribution (a sum of K iid mean-zero FP4
+//    products; validated against the direct computation at K=256).
+// B: one global scale against per-chunk scales on heavy-tailed data.
+// C: bytes of the scale collective that must precede the payload.
 static void exp_llm() {
-    printf("\n[14] scaling to 1B+ parameters: what breaks and what holds\n");
-    // Exact second moment of one q1*q2 product over the 15 legal codes.
-    double m2 = 0;
+    printf("\n[14] scaling to 1B+ parameters\n");
+    double m2 = 0;                                  // E[q^2] over the legal codes
     for (int a = 0; a < 15; ++a) m2 += (double)e2m1_q(LEGAL[a]) * e2m1_q(LEGAL[a]);
     m2 /= 15.0;
-    const double sig_prod = m2 * m2;               // Var(q1*q2) = E[q1^2] E[q2^2]
-    // ------------------------------------------------------------- validate
-    printf("\n    A. the a-priori 144*K*P bound against the range the data actually uses\n");
+    const double sig_prod = m2 * m2;                // Var(q1*q2) = E[q1^2] E[q2^2]
+    printf("\n    A. the a-priori 144*K*P bound against the range the data uses\n");
     {
         const int NV = 4096, KV = 256, PV = 8;
         std::uniform_int_distribution<int> cd(0, 14);
         double am_direct = 0;
-        for (int i = 0; i < NV; ++i) {
-            long long s = 0;
-            for (int r = 0; r < PV; ++r)
-                for (int k = 0; k < KV; ++k)
-                    s += (long long)e2m1_q(LEGAL[cd(rng)]) * e2m1_q(LEGAL[cd(rng)]);
-            am_direct = std::max(am_direct, fabs((double)s));
-        }
+        for (int i = 0; i < NV; ++i)
+            am_direct = std::max(am_direct, fabs((double)fp4_dot(KV * PV, cd)));
         std::normal_distribution<double> nd(0.0, sqrt((double)KV * PV * sig_prod));
         double am_surr = 0;
         for (int i = 0; i < NV; ++i) am_surr = std::max(am_surr, fabs(nd(rng)));
@@ -1052,13 +869,12 @@ static void exp_llm() {
                KV, PV, am_direct, am_surr, am_surr / am_direct);
     }
     printf("\n    %7s %6s %14s %12s %10s %12s %12s\n",
-           "K", "P", "144*K*P bound", "real amax", "bits lost", "int16 a-pri", "int16 meas");
+           "K", "P", "144*K*P bound", "real amax", "bits lost", "int16 a-pri", "int16 amax");
     const int NBIG = 1 << 20;
     for (int K : {256, 1024, 4096, 16384}) {
         for (int P : {8, 128, 1024}) {
             double bound = (double)FP4_PMAX * K * P;
-            double sd = sqrt((double)K * P * sig_prod);
-            std::normal_distribution<double> nd(0.0, sd);
+            std::normal_distribution<double> nd(0.0, sqrt((double)K * P * sig_prod));
             double amax = 0, sn = 0;
             for (int i = 0; i < NBIG; ++i) {
                 double v = nd(rng);
@@ -1066,28 +882,15 @@ static void exp_llm() {
                 sn += v * v;
             }
             sn = sqrt(sn / NBIG);
-            double lost = log2(bound / amax);
-            // RMS relative error of a uniform quantizer with 15 magnitude bits
-            // over each of the two ranges. Per-rank roundings add as sqrt(P).
-            double step_a = bound / 32767.0, step_m = amax / 32767.0;
-            double ea = 100.0 * (step_a / sqrt(12.0)) * sqrt((double)P) / sn;
-            double em = 100.0 * (step_m / sqrt(12.0)) * sqrt((double)P) / sn;
+            // Uniform quantizer with 15 magnitude bits over each range; P
+            // per-rank roundings add as sqrt(P).
+            double ea = 100.0 * (bound / 32767.0 / sqrt(12.0)) * sqrt((double)P) / sn;
+            double em = 100.0 * (amax / 32767.0 / sqrt(12.0)) * sqrt((double)P) / sn;
             printf("    %7d %6d %14.3e %12.3e %10.1f %11.3f%% %11.4f%%\n",
-                   K, P, bound, amax, lost, ea, em);
+                   K, P, bound, amax, log2(bound / amax), ea, em);
         }
     }
-    printf("\n       The a-priori bound loses half a bit per doubling of K*P, because it\n");
-    printf("       grows linearly while the data only grows as sqrt. By K=16384 and\n");
-    printf("       P=1024 it is 11.6 bits looser than the data needs, leaving about 3\n");
-    printf("       of int16's 15 -- and a 3-bit gradient is a 455%% error, which is to\n");
-    printf("       say no gradient. The measured column at the same size is 0.14%%.\n");
-    printf("\n       The bound is not useless, it is just not a grid spacing. What it\n");
-    printf("       gives is the guarantee that every partial is an INTEGER on a known\n");
-    printf("       lattice, which is what makes the sum exact once you have picked a\n");
-    printf("       spacing. Pick the spacing from a measured amax.\n");
-    // ------------------------------------------------------------------ B
-    printf("\n    B. one global scale over a whole tensor, against per-chunk scales\n");
-    printf("       %d elements, standard normal, then with 0.1%% of values at 30 sigma.\n", NBIG);
+    printf("\n    B. one global scale against per-chunk scales, %d elements\n", NBIG);
     printf("\n    %-22s %8s %10s %13s %10s\n", "data", "scale", "chunk", "rel err (RMS)", "b/el");
     for (int outl = 0; outl < 2; ++outl) {
         std::normal_distribution<double> nd(0.0, 1.0);
@@ -1121,46 +924,18 @@ static void exp_llm() {
             }
         }
     }
-    printf("\n       chunk 0 means one scale for the whole tensor. Two things to read\n");
-    printf("       here, and only one of them is the interesting one.\n");
-    printf("\n       int16 barely cares. Even with 0.1%% of values at 30 sigma, a global\n");
-    printf("       scale costs it 0.063%% and per-512 chunks only get that to 0.013%% --\n");
-    printf("       a 5x that nobody is going to notice downstream. Fifteen bits has\n");
-    printf("       enough room that outliers do not have to be handled, only survived.\n");
-    printf("\n       int8 gets the SAME ~5x from chunking -- 16.2%% down to 3.4%% -- and\n");
-    printf("       that is the whole point: the ratio is a property of the data, not of\n");
-    printf("       the width, but 16%% against 3.4%% is a decision and 0.063%% against\n");
-    printf("       0.013%% is not. Chunking does not become more effective at 8 bits, it\n");
-    printf("       becomes necessary, because that is where the error crosses into the\n");
-    printf("       range where anyone cares. A 2-byte scale per 4096 costs 0.05%%.\n");
-    // ------------------------------------------------------------------ C
-    printf("\n    C. the cost of agreeing the scales, per gradient all-reduce\n");
-    printf("       Ranks must share a grid or the integers do not line up, so the\n");
-    printf("       scales go first, as their own (tiny) max-all-reduce.\n");
-    printf("\n    %-12s %12s %12s %14s %12s %10s\n",
-           "model", "params", "bf16 GB", "int16+sc GB", "scale GB", "overhead");
+    printf("    (chunk 0 = one scale for the whole tensor)\n");
+    printf("\n    C. bytes of the scale collective, ring all-reduce at P=1024, one 2 B scale per 4096\n");
+    printf("\n    %-8s %12s %12s %12s %10s\n", "model", "params", "payload GB", "scale GB", "overhead");
     struct { const char *nm; double p; } models[] = {
         {"1B", 1.0e9}, {"7B", 7.0e9}, {"70B", 70.0e9}, {"405B", 405.0e9}};
-    const int CHC = 4096;
     for (auto &M : models) {
-        double f = 2.0 * (1024 - 1) / 1024.0;               // ring, P=1024
-        double bf = M.p * 2 * f / 1e9;
-        double sc = (M.p / CHC) * 2 * f / 1e9;
-        double it = M.p * 2 * f / 1e9;
-        printf("    %-12s %12.1e %12.2f %14.2f %12.4f %9.3f%%\n",
-               M.nm, M.p, bf, it, sc, 100.0 * sc / it);
+        double f = 2.0 * 1023 / 1024.0;
+        double pay = M.p * 2 * f / 1e9, sc = (M.p / 4096) * 2 * f / 1e9;
+        printf("    %-8s %12.1e %12.2f %12.4f %9.3f%%\n", M.nm, M.p, pay, sc, 100.0 * sc / pay);
     }
-    printf("\n       Same bytes on the wire as bf16 plus a rounding error of overhead,\n");
-    printf("       for a payload that is exact under summation. The real cost is the\n");
-    printf("       extra latency: two dependent collectives instead of one. At 1024\n");
-    printf("       ranks a small all-reduce is ~50-100 us, so this is only worth it\n");
-    printf("       for tensors big enough that the payload dominates -- which, at\n");
-    printf("       these sizes, every one of them is. It also pipelines: compute the\n");
-    printf("       scales for bucket i+1 while bucket i is on the wire.\n");
-    printf("\n       At int8 with per-4096 scales the payload halves again to %.2f GB\n",
-           7.0e9 * 1.0 * (2.0 * 1023 / 1024) / 1e9);
-    printf("       for a 7B model, at the error in the [13] int8 row.\n");
 }
+
 // ============================================================================
 // Shared multi-step gradient model for [15]-[17]
 // ============================================================================

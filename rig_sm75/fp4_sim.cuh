@@ -1,13 +1,5 @@
-// FP4 logic + narrow-accumulator simulation, portable down to sm_75.
-//
-// Nothing here needs tensor cores, FP8, bf16 or cp.async. A GTX 1650 SUPER
-// (TU116, sm_75) has none of those -- it does not even have tensor cores -- but
-// the two claims we care about are not about tensor cores:
-//
-//   1. how many significand bits a packed dual dot product needs
-//   2. how much traffic the reduction step costs with 1 vs 2 accumulators
-//
-// Both are arithmetic and bandwidth questions, so they reproduce on any GPU.
+// FP4 (E2M1) grid, FP4 -> FP8 expansion and a narrow-accumulator model.
+// Plain CUDA-core code, sm_75 and up.
 #pragma once
 #include <stdint.h>
 

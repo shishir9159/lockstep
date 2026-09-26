@@ -1,17 +1,11 @@
-// Block-scaled quantization formats, host+device, portable to sm_75.
-//
-// Everything here is arithmetic, so a card with no FP8 hardware reproduces the
-// numerics of a card that has it. What it cannot reproduce is the speed.
+// Block-scaled quantization formats in software, host + device, sm_75 and up.
 //
 //   MXFP4   block 32, E8M0 scale (power of two), E2M1 elements   4.25 bit/elem
 //   NVFP4   block 16, E4M3 scale (has a mantissa), E2M1 elements  4.50 bit/elem
 //   MXFP8   block 32, E8M0 scale, E4M3 elements                   8.25 bit/elem
 //
-// The scale format is the interesting axis. E8M0 can only ever be a power of
-// two, so it throws away up to 2x of the block's dynamic range before a single
-// element is rounded. E4M3 carries 3 mantissa bits, so it lands much closer to
-// amax/6 -- which is why NVFP4 beats MXFP4 by more than the block size alone
-// would explain.
+// E8M0 can only be a power of two, so it can waste up to 2x of a block's range;
+// E4M3 lands close to amax/6.
 #pragma once
 #include <stdint.h>
 #include <math.h>
@@ -47,9 +41,9 @@ __host__ __device__ inline float quant_e8m0(float x) {
     return ldexpf(1.0f, e);
 }
 
-// A power of two chosen so that x/scale never exceeds 1. Rounding the shared
-// exponent DOWN makes the grid too fine and clamps the top of every block --
-// which shows up as an error floor that does not improve with mantissa width.
+// A power of two >= x, so x/scale never exceeds 1. Rounding a shared exponent
+// down instead clamps the top of every block: an error floor that does not
+// improve with mantissa width.
 __host__ __device__ inline float quant_e8m0_up(float x) {
     if (!(x > 0.f)) return 1.0f;
     int e = (int)ceilf(log2f(x));
@@ -60,9 +54,8 @@ __host__ __device__ inline float quant_e8m0_up(float x) {
 }
 
 // ------------------------------------------------------------------- E2M1
-// Nearest E2M1 code for a value already divided by the block scale.
-// Ties fall to the smaller magnitude, which matches a round-toward-zero tie
-// rule; the format is so coarse that the tie rule is noise next to the step.
+// Nearest E2M1 code for a value already divided by the block scale. Ties go
+// to the smaller magnitude (OCP specifies ties-to-even); fp4.py matches.
 __host__ __device__ inline int quant_e2m1_code(float v) {
     const float m[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     float a = fabsf(v);
@@ -103,15 +96,7 @@ __host__ __device__ inline float nv_scale_e2m1(float amax) {
     return s > 0.f ? s : E4M3_MIN_SUB;
 }
 
-// ------------------------------------------------- fixed-point, a-priori bound
-// The whole point of the FP4 grid: a K-deep dot product of E2M1 values on the
-// integer grid q = 2*value is an integer with |dot| <= 144*K. That bound is
-// known before you look at the data -- no amax pass, no calibration, no
-// communication. Which means a fixed-point encoding with that scale is
-// deterministic, and summing several of them is EXACT integer addition rather
-// than a chain of floating-point roundings.
+// Scale that maps `bound` onto the largest magnitude of a signed `bits` field.
 __host__ __device__ inline double fixed_scale(double bound, int bits) {
-    // Largest representable magnitude in a signed `bits` field.
-    double top = (double)((1LL << (bits - 1)) - 1);
-    return top / bound;
+    return (double)((1LL << (bits - 1)) - 1) / bound;
 }
