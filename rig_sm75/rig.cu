@@ -1,24 +1,14 @@
-// Test rig for a GTX 1650 SUPER (TU116, sm_75) -- no tensor cores, no FP8,
-// no bf16, no cp.async. Everything here runs on plain CUDA cores.
+// rig -- does packing two FP4 results into one accumulator work? [1]-[5],
+// plain CUDA cores, sm_75 and up (no tensor cores, FP8, bf16 or cp.async).
 //
-// The two claims worth testing do not need a tensor core:
+//   [1] unpack   FP4 -> FP8 via prmt, exhaustive over 16^4 inputs
+//   [2] bits     packed dual dot product on a modelled W-bit accumulator
+//   [3] reduce   split-K traffic, 1 accumulator vs 2 (upper bound on packing)
+//   [4] gemm     fwd + wgrad: 2 launches / concat / fused 2-acc / packed 1-acc
+//   [5] splitk   split-K with packed int16 partials as a transport format
 //
-//   1. BIT BUDGET. A packed dual dot product acc = C1 + 2^s*C2 needs
-//      2*ceil(log2(144K)) + 1 significand bits. fp32 has 24; the Hopper FP8 MMA
-//      datapath has ~14. We model a W-bit accumulator in software and measure
-//      the exact-recovery rate, so the number you get here predicts the H100.
-//
-//   2. REDUCTION TRAFFIC. One accumulator instead of two halves the atomic
-//      traffic in the split-K reduction. That is bandwidth, and this card has
-//      bandwidth, so the speedup measured here is the real upper bound on what
-//      the packing could ever buy.
-//
-// Experiment 1 checks the FP4 -> FP8 expansion (prmt exists on sm_75).
-// Experiment 4 runs a minimal fwd/wgrad on CUDA-core GEMMs.
-//
-//   nvcc -O3 -arch=sm_75 -o rig rig.cu
-//   ./rig            # all four
-//   ./rig bits       # just the bit budget
+//   nvcc -O3 -std=c++17 -arch=sm_75 -o rig rig.cu
+//   ./rig [name]
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -27,6 +17,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
+#include <algorithm>
 #include "fp4_sim.cuh"
 
 #define CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) {                  \
@@ -90,10 +81,19 @@ __global__ void packed_dot(const signed char *__restrict__ A1, const signed char
     out[t] = acc;
 }
 
+// Host model of a W-bit significand (W <= 53), round half away from zero.
+static double round_sig_d(double x, int W) {
+    if (x == 0.0) return 0.0;
+    int e;
+    double m = frexp(x, &e);
+    return ldexp(round(ldexp(m, W)), e - W);
+}
+
 static void exp_bits() {
     printf("\n[2] packed dual dot product: acc = C1 + 2^s*C2 on a W-bit accumulator\n");
-    printf("    W=24 is a true fp32 accumulator, W=14 models the Hopper FP8 MMA path\n\n");
-    printf("    %5s %4s %8s %10s %10s %10s\n", "K", "s", "need", "W=14", "W=24", "W=31*");
+    printf("    W=24 is fp32, W=14 models the Hopper FP8 MMA path (both on the GPU);\n");
+    printf("    W=31 is modelled on the host in fp64, as a control that enough bits suffice\n\n");
+    printf("    %5s %4s %8s %10s %10s %10s\n", "K", "s", "need", "W=14", "W=24", "W=31");
     const int n = 4096;
     std::uniform_int_distribution<int> cd(0, 14);
     const int codes[15] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
@@ -128,24 +128,36 @@ static void exp_bits() {
         const float sf = ldexpf(1.f, s);
         printf("    %5d %4d %8d", K, s, packed_bits_needed(K));
 
-        for (int W : {14, 24, 31}) {
+        auto recovered = [&](const std::vector<double> &h) {
+            int ok = 0;
+            for (int t = 0; t < n; ++t) {
+                double g2 = nearbyint(h[t] / (double)sf);
+                double g1 = h[t] - g2 * (double)sf;
+                if (g1 == (double)c1[t] && g2 == (double)c2[t]) ++ok;
+            }
+            return 100.0 * ok / n;
+        };
+        for (int W : {14, 24}) {
             packed_dot<<<(n + 255) / 256, 256>>>(dA1, dB1, dA2, dB2, dOut, n, K, sf, 24 - W);
             CHECK(cudaDeviceSynchronize());
             std::vector<float> h(n);
             CHECK(cudaMemcpy(h.data(), dOut, n * 4, cudaMemcpyDeviceToHost));
-            int ok = 0;
-            for (int t = 0; t < n; ++t) {
-                double g2 = nearbyint((double)h[t] / (double)sf);
-                double g1 = (double)h[t] - g2 * (double)sf;
-                if (g1 == (double)c1[t] && g2 == (double)c2[t]) ++ok;
-            }
-            printf(" %9.1f%%", 100.0 * ok / n);
+            printf(" %9.1f%%", recovered(std::vector<double>(h.begin(), h.end())));
         }
-        printf("\n");
+        std::vector<double> h31(n);
+        for (int t = 0; t < n; ++t) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k) {
+                size_t o = (size_t)t * K + k;
+                acc = round_sig_d(acc + (double)a1[o] * b1[o], 31);
+                acc = round_sig_d(acc + (double)sf * ((double)a2[o] * b2[o]), 31);
+            }
+            h31[t] = acc;
+        }
+        printf(" %9.1f%%\n", recovered(h31));
         cudaFree(dA1); cudaFree(dB1); cudaFree(dA2); cudaFree(dB2); cudaFree(dOut);
     }
-    printf("\n    need = 2*ceil(log2(144K)) + 1. * W=31 is not reachable in fp32; it is\n");
-    printf("    shown to confirm the failures above are width, not a coding bug.\n");
+    printf("\n    need = 2*ceil(log2(144K)) + 1\n");
 }
 
 // ============================================================ 3. reduction traffic
@@ -368,10 +380,8 @@ static void exp_gemm() {
     }, fl);
     printf("    vs vanilla: concat %.2fx, fused %.2fx, packed %.2fx\n",
            tv / tc, tv / tf, tv / tp);
-    printf("    ATTRIBUTION: fused gets %.2fx from loading B once (no bit trick,\n",
-           tv / tf);
-    printf("    both results kept exactly). Packing adds %.2fx on top of that,\n", tf / tp);
-    printf("    from one accumulator register and one store instead of two.\n");
+    printf("    attribution: operand reuse (fused) %.2fx, packing on top of it %.2fx\n",
+           tv / tf, tf / tp);
 
     // Is the packed forward result actually recoverable? Spot-check exactly.
     std::vector<float> hc(( size_t)B * COUT);
@@ -408,11 +418,8 @@ static void exp_gemm() {
     float wc = time_it("concat-K: 1 GEMM, 1 accumulator", [&] {
         gemm_tiled_at<<<gw, blk>>>(dY, X, dW, COUT, CIN, 2 * B);
     }, 2.0 * COUT * CIN * (2 * B));
-    printf("    concat-K %.2fx vs vanilla\n", wv / wc);
-    printf("    Folding the add into the accumulator saves ~12 MB of traffic, which\n");
-    printf("    is nothing next to a CUDA-core GEMM. On a tensor-core H100 the same\n");
-    printf("    GEMM is ~200x faster while the add is not, so the ratio there is not\n");
-    printf("    this ratio -- see the caveat at the end.\n");
+    printf("    concat-K %.2fx vs vanilla (CUDA-core GEMM; the add is relatively larger on\n"
+           "    tensor cores, so this ratio does not transfer)\n", wv / wc);
 
     // Both wgrad paths must agree exactly: same integers, same order per output.
     {
@@ -436,23 +443,10 @@ static void exp_gemm() {
 }
 
 // ============================== 5. split-K with packed int16 partials =========
-//
-// The repaired version of the packing idea. Two changes from experiment [3]:
-//
-//   * packing is a TRANSPORT format, not an accumulation format. Two int16
-//     partials share one int32 word. Nothing is ever multiplied while packed and
-//     nothing accumulates while packed, so there are no cross terms and no
-//     accumulator-width problem -- the reduce kernel unpacks first, then sums in
-//     full int32 width.
-//   * partials go to memory and a second kernel reduces them, instead of
-//     atomics. That is what makes unpack-before-sum possible, and it is usually
-//     faster than atomics anyway.
-//
-// Exactness condition: a split of depth d has |partial| <= 144*d, so int16 holds
-// it exactly while d <= 227. Split deep enough and the packing is lossless.
-//
-// The GEMM is the fused shared-operand form: Bt is loaded once and feeds both
-// microbatches, which is the 1.4-1.5x from experiment [4].
+// Packing as a TRANSPORT format: two int16 partials share one int32 word and
+// are unpacked before they are summed, so nothing is multiplied or accumulated
+// while packed. Partials go to memory for a second kernel instead of atomics.
+// Exact while the split depth d <= 227, since |partial| <= 144*d.
 #define SK_TS 16
 #define SK_TK 16
 #define SK_PAD 4
@@ -484,8 +478,8 @@ __global__ __launch_bounds__(SK_TS * SK_TS) void splitk_fused(
             int a1 = *(const int *)&sA1[threadIdx.y][kk];
             int a2 = *(const int *)&sA2[threadIdx.y][kk];
             int b = *(const int *)&sB[threadIdx.x][kk];
-            acc1 = __dp4a(a1, b, acc1);       // 4 int8 MACs in one instruction
-            acc2 = __dp4a(a2, b, acc2);       // Bt reused: the fused-operand win
+            acc1 = __dp4a(a1, b, acc1);
+            acc2 = __dp4a(a2, b, acc2);       // Bt reused by both microbatches
         }
         __syncthreads();
     }
@@ -523,7 +517,7 @@ __global__ void reduce_packed(const int *__restrict__ part, int *c1, int *c2,
     int a = 0, b = 0;
     for (int s = 0; s < S; ++s) {
         unsigned p = (unsigned)part[(size_t)s * MN + i];
-        a += (int)(short)(p & 0xFFFF);        // unpack, THEN sum in full width
+        a += (int)(short)(p & 0xFFFF);        // unpack, then sum in full width
         b += (int)(short)(p >> 16);
     }
     c1[i] = a; c2[i] = b;
@@ -532,9 +526,7 @@ __global__ void reduce_packed(const int *__restrict__ part, int *c1, int *c2,
 static void exp_splitk() {
     const int M = 256, N = 256, K = 8192;
     const size_t MN = (size_t)M * N;
-    printf("\n[5] split-K, fused shared operand, packed int16 partials\n");
-    printf("    M=%d N=%d K=%d, skinny enough that split-K earns its place\n", M, N, K);
-    printf("    int8 operands on the FP4 grid, int32 accumulate, dp4a inner loop\n");
+    printf("\n[5] split-K with packed int16 partials, M=%d N=%d K=%d, dp4a GEMM\n", M, N, K);
 
     std::uniform_int_distribution<int> cd(0, 14);
     const int codes[15] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15};
@@ -579,12 +571,11 @@ static void exp_splitk() {
         for (int r = 0; r < 5; ++r) {
             tm.start();
             for (int i = 0; i < iters; ++i) fn();
-            float ms = tm.stop() / iters;
-            if (ms < best) best = ms;
+            best = std::min(best, tm.stop() / iters);
         }
         return best;
     };
-    auto verify = [&](const char *tag) {
+    auto verdict = [&]() {
         std::vector<int> h1(MN), h2(MN);
         CHECK(cudaMemcpy(h1.data(), c1, MN * 4, cudaMemcpyDeviceToHost));
         CHECK(cudaMemcpy(h2.data(), c2, MN * 4, cudaMemcpyDeviceToHost));
@@ -593,17 +584,16 @@ static void exp_splitk() {
             size_t i = (size_t)sample[q].first * N + sample[q].second;
             if ((long long)h1[i] != r1[q] || (long long)h2[i] != r2[q]) ++bad;
         }
-        printf("%s%s", bad ? "  WRONG(" : "  exact", bad ? "" : "");
-        if (bad) printf("%zu/%zu)", bad, sample.size());
-        return bad;
+        return bad ? "WRONG" : "exact";
     };
 
-    printf("\n    %4s %5s %7s %10s %10s %10s %9s\n",
-           "S", "depth", "int16?", "gemm ms", "reduce ms", "total ms", "verdict");
+    printf("\n    %4s %5s %7s %10s %10s %10s  %-8s %s\n",
+           "S", "depth", "int16?", "gemm ms", "reduce ms", "total ms", "path", "check");
 
-    double gemm_flops = 2.0 * 2 * M * N * K;
-    float packed_total_ref = 0.f, store2_total_ref = 0.f;
-    double packed_bytes_ref = 0, store2_bytes_ref = 0;
+    const double gemm_ops = 2.0 * 2 * M * N * K;
+    float packed_ref = 0.f, store2_ref = 0.f, gemm_ref = 0.f;
+    double packed_bytes = 0, store2_bytes = 0;
+    const unsigned rg = (unsigned)((MN + 255) / 256);
 
     for (int S : {32, 64, 128, 256}) {
         const int d = K / S;
@@ -611,77 +601,61 @@ static void exp_splitk() {
         dim3 grd(N / SK_TS, M / SK_TS, S);
         const bool safe = (long long)FP4_PMAX * d <= 32767;
 
-        // --- path 1: two int32 partials + reduce -----------------------------
         float g1 = best_of([&] { splitk_fused<1><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S); });
-        float rd1 = best_of([&] {
-            reduce_store2<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
-        });
+        float rd1 = best_of([&] { reduce_store2<<<rg, 256>>>(part, c1, c2, MN, S); });
         splitk_fused<1><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S);
-        reduce_store2<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        reduce_store2<<<rg, 256>>>(part, c1, c2, MN, S);
         CHECK(cudaDeviceSynchronize());
-        printf("    %4d %5d %7s %10.3f %10.3f %10.3f", S, d, safe ? "safe" : "OVERFL",
-               g1, rd1, g1 + rd1);
-        printf("  int32x2"); verify(""); printf("\n");
+        printf("    %4d %5d %7s %10.3f %10.3f %10.3f  %-8s %s\n", S, d, safe ? "safe" : "OVERFL",
+               g1, rd1, g1 + rd1, "int32x2", verdict());
 
-        // --- path 2: packed int16 pair + reduce ------------------------------
         float g2 = best_of([&] { splitk_fused<2><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S); });
-        float rd2 = best_of([&] {
-            reduce_packed<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
-        });
+        float rd2 = best_of([&] { reduce_packed<<<rg, 256>>>(part, c1, c2, MN, S); });
         splitk_fused<2><<<grd, blk>>>(A1, A2, Bt, part, M, N, K, S);
-        reduce_packed<<<(unsigned)((MN + 255) / 256), 256>>>(part, c1, c2, MN, S);
+        reduce_packed<<<rg, 256>>>(part, c1, c2, MN, S);
         CHECK(cudaDeviceSynchronize());
-        printf("    %4s %5s %7s %10.3f %10.3f %10.3f", "", "", "", g2, rd2, g2 + rd2);
-        printf("  packed "); verify(""); printf("  %.2fx\n", (g1 + rd1) / (g2 + rd2));
+        printf("    %4s %5s %7s %10.3f %10.3f %10.3f  %-8s %s  %.2fx\n", "", "", "", g2, rd2,
+               g2 + rd2, "packed", verdict(), (g1 + rd1) / (g2 + rd2));
 
-        // --- path 3: atomics, for reference -----------------------------------
         float g3 = best_of([&] {
             CHECK(cudaMemsetAsync(atom, 0, MN * 8));
             splitk_fused<0><<<grd, blk>>>(A1, A2, Bt, atom, M, N, K, S);
         });
-        printf("    %4s %5s %7s %10.3f %10s %10.3f  atomics\n", "", "", "", g3, "-", g3);
+        printf("    %4s %5s %7s %10.3f %10s %10.3f  atomics\n\n", "", "", "", g3, "-", g3);
 
         if (S == 64) {
-            packed_total_ref = g2 + rd2;
-            store2_total_ref = g1 + rd1;
-            packed_bytes_ref = (double)S * MN * 4 * 2 + MN * 8;   // write + read + out
-            store2_bytes_ref = (double)S * MN * 8 * 2 + MN * 8;
+            packed_ref = g2 + rd2;
+            store2_ref = g1 + rd1;
+            gemm_ref = g2;
+            packed_bytes = (double)S * MN * 4 * 2 + MN * 8;    // write + read + out
+            store2_bytes = (double)S * MN * 8 * 2 + MN * 8;
         }
-        printf("\n");
     }
+    printf("    OVERFL = 144*depth > 32767 (worst case); random data still verifies.\n");
+    printf("    Atomics stay in L2 here (%.0f KB output); two-phase paths write %.0f MB.\n",
+           MN * 8 / 1024.0, (double)64 * MN * 8 / 1e6);
 
-    // ---- what this looks like on an H100 --------------------------------------
-    printf("    NOTES\n");
-    printf("      The OVERFL row is a WORST-CASE bound (144*depth > 32767), not a\n");
-    printf("      measurement. Random FP4 data does not reach the bound, so it still\n");
-    printf("      verifies exact -- do not ship it on that evidence. depth <= 227 is\n");
-    printf("      the condition that is safe for any input.\n");
-    printf("      Atomics look good here because the output is only %.0f KB and fits\n",
-           MN * 8 / 1024.0);
-    printf("      in this card's 1 MB L2, so they never reach DRAM. The two-phase\n");
-    printf("      paths write %.0f MB of partials and do. Packing helps exactly when\n",
-           (double)64 * MN * 8 / 1e6);
-    printf("      the partials are too big for L2 -- raise M,N or S and atomics lose.\n");
-
-    if (store2_total_ref > 0.f) {
-        printf("\n    ROOFLINE (arithmetic, not measured) at S=64:\n");
-        printf("      partial traffic  %6.1f MB unpacked -> %6.1f MB packed\n",
-               store2_bytes_ref / 1e6, packed_bytes_ref / 1e6);
-        const double h100_ops = 1400e12, h100_bw = 3350e9;     // achieved, not peak
-        double gemm_h = gemm_flops / h100_ops * 1e3;
-        double red_hu = store2_bytes_ref / h100_bw * 1e3;
-        double red_hp = packed_bytes_ref / h100_bw * 1e3;
-        printf("      this card : %.3f -> %.3f ms measured, %.2fx; traffic is %.0f%%\n",
-               store2_total_ref, packed_total_ref, store2_total_ref / packed_total_ref,
-               100.0 * (store2_bytes_ref / 192e9 * 1e3) / store2_total_ref);
-        printf("      H100 est. : gemm %.4f ms, traffic %.4f ms -> reduce is %.0f%%\n",
-               gemm_h, red_hu, 100.0 * red_hu / (gemm_h + red_hu));
-        printf("      packing on H100: %.4f -> %.4f ms, %.2fx end to end\n",
-               gemm_h + red_hu, gemm_h + red_hp, (gemm_h + red_hu) / (gemm_h + red_hp));
-        printf("      This is the one place your slower-card reasoning is exactly\n");
-        printf("      right: an H100 does ~%.0fx more arithmetic per byte moved, so a\n",
-               (h100_ops / h100_bw) / (900e9 / 192e9));
-        printf("      byte you avoid moving is worth that much more there.\n");
+    if (store2_ref > 0.f) {
+        // Peak DRAM bandwidth from the device, achieved GEMM rate from the timing
+        // above; H100 figures are achieved-rate assumptions, not measurements.
+        int clk_khz = 0, bus_bits = 0;
+        CHECK(cudaDeviceGetAttribute(&clk_khz, cudaDevAttrMemoryClockRate, 0));
+        CHECK(cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, 0));
+        const double card_bw = 2.0 * clk_khz * 1e3 * bus_bits / 8.0;
+        const double card_ops = gemm_ops / (gemm_ref * 1e-3);
+        const double h100_ops = 1400e12, h100_bw = 3350e9;
+        const double gemm_h = gemm_ops / h100_ops * 1e3;
+        const double red_hu = store2_bytes / h100_bw * 1e3, red_hp = packed_bytes / h100_bw * 1e3;
+        printf("\n    roofline at S=64 (partials %.1f MB unpacked -> %.1f MB packed):\n",
+               store2_bytes / 1e6, packed_bytes / 1e6);
+        printf("      this card: %.3f -> %.3f ms measured, %.2fx; traffic is %.0f%% of runtime\n",
+               store2_ref, packed_ref, store2_ref / packed_ref,
+               100.0 * (store2_bytes / card_bw * 1e3) / store2_ref);
+        printf("      H100 est.: %.4f -> %.4f ms, %.2fx; traffic is %.0f%% of runtime\n",
+               gemm_h + red_hu, gemm_h + red_hp, (gemm_h + red_hu) / (gemm_h + red_hp),
+               100.0 * red_hu / (gemm_h + red_hu));
+        printf("      (H100 does %.0fx more ops per byte than this card: %.0f GOP/s, %.0f GB/s)\n",
+               (h100_ops / h100_bw) / (card_ops / card_bw), card_ops / 1e9, card_bw / 1e9);
     }
 
     cudaFree(A1); cudaFree(A2); cudaFree(Bt);
@@ -689,30 +663,27 @@ static void exp_splitk() {
 }
 
 int main(int argc, char **argv) {
+    struct { const char *name; void (*fn)(); } exps[] = {
+        {"unpack", [] { exp_unpack(); }}, {"bits", exp_bits}, {"reduce", exp_reduce},
+        {"gemm", exp_gemm}, {"splitk", exp_splitk}};
+    const char *only = argc > 1 ? argv[1] : nullptr;
+    bool known = !only;
+    for (auto &e : exps) known = known || !strcmp(only, e.name);
+    if (!known) {
+        fprintf(stderr, "unknown experiment '%s'; one of:", only);
+        for (auto &e : exps) fprintf(stderr, " %s", e.name);
+        fprintf(stderr, "\n");
+        return 1;
+    }
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
     printf("%s  sm_%d%d  %.1f GiB  %d SMs\n", p.name, p.major, p.minor,
            p.totalGlobalMem / 1073741824.0, p.multiProcessorCount);
-    if (p.major >= 9) printf("  (this rig is the portable one; use ../ for the Hopper kernels)\n");
-
-    const char *only = argc > 1 ? argv[1] : nullptr;
-    auto want = [&](const char *n) { return !only || !strcmp(only, n); };
-    if (want("unpack")) exp_unpack();
-    if (want("bits")) exp_bits();
-    if (want("reduce")) exp_reduce();
-    if (want("gemm")) exp_gemm();
-    if (want("splitk")) exp_splitk();
-
-    printf("\nWHAT TRANSFERS TO AN H100, AND WHAT DOES NOT\n");
-    printf("  transfers: [1] and [2]. Bit widths are bit widths. The exact-recovery\n");
-    printf("    rates in [2] are a property of the arithmetic, not of this card, and\n");
-    printf("    they match an independent CPU bignum simulation of the same thing.\n");
-    printf("  transfers: [3]. Atomic reduction traffic is bandwidth-bound on every\n");
-    printf("    GPU, so the ratio is the honest upper bound on the packing idea.\n");
-    printf("  does NOT transfer: [4] absolute rates and the wgrad ratio. A CUDA-core\n");
-    printf("    GEMM here is ~200x slower than an H100 tensor-core GEMM, so epilogue\n");
-    printf("    and add costs look free here and do not there. Use [4] for the\n");
-    printf("    ATTRIBUTION line (fusion vs packing), not for absolute speedups.\n");
+    for (auto &e : exps)
+        if (!only || !strcmp(only, e.name)) {
+            rng.seed(12345);        // each experiment reproduces standalone
+            e.fn();
+        }
     printf("\n");
     return 0;
 }
