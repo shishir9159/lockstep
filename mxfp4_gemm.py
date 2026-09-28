@@ -106,8 +106,9 @@ def _unpack_to_e4m3(byts, BM: tl.constexpr, HALF: tl.constexpr):
     """[BM, HALF] packed uint8 -> [BM, 2*HALF] fp8e4nv, low nibble first.
 
     E2M1 code n maps to the E4M3 byte  sign<<7 | (exp+6)<<3 | mant<<2, which
-    collapses to ((n & 8) << 4) | ((n & 7) << 2) | 0x30 for magnitude codes >= 2.
-    Codes 0 (+-0.0) and 1 (+-0.5) are special-cased. Table:
+    collapses to ((n & 8) << 4) | (((n & 7) << 2) + 0x30) for magnitude codes
+    >= 2 (an add, not an OR: bit 4 carries). Codes 0 (+-0.0) and 1 (+-0.5) are
+    special-cased. Table:
         code 0..7 -> 0x00 0x30 0x38 0x3C 0x40 0x44 0x48 0x4C
     """
     b = byts.to(tl.int32)

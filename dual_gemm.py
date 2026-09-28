@@ -1,32 +1,17 @@
-"""The packed dual-batch GEMM experiment.
+"""Packed dual-batch GEMM: can two FP4 GEMMs share one fp32 accumulator?
 
-Hypothesis under test: two independent FP4 GEMMs C1 = A1 B1 and C2 = A2 B2 can
-share ONE fp32 accumulator, because FP4 dot products are integers and can be
-stacked in disjoint bit fields:
+    acc = sum(A1 B1) + 2^s * sum(A2 B2)
 
-        acc = sum(A1 B1) + 2^s * sum(A2 B2)
+Values ride the integer grid q = 2*value (|q1*q2| <= 144, |dot| <= 144*K), so
+both results are exact integers and the split is well defined. Two limits:
 
-If that holds, the mainloop needs half the accumulator registers and split-K
-needs half the partial-sum traffic -- the reduction win.
+  encoding     the 2^s offset lives in the operand: free in bf16, but e4m3
+               saturates at 448, so s <= 10 against the 14 that K=32 needs.
+  accumulator  [C1 : s][C2 : s] needs 2*ceil(log2(144K)) + 1 bits: 27 at K=32,
+               against fp32's 24 and the Hopper FP8 path's ~14.
 
-Two things decide whether it holds, and this file measures both on real silicon:
-
-  encoding     the 2^s offset has to live somewhere. In bf16 it is free (it is
-               just the exponent field). In fp8 e4m3 the operand saturates at
-               448, so at most 2^5 can be folded per side, i.e. s <= 10 --
-               already short of the s = 14 that K = 32 needs.
-
-  accumulator  the slot layout is [C1 : s bits][C2 : s bits], so the accumulator
-               needs 2*ceil(log2(144*K)) + 1 bits: 27 at K=32, 31 at K=128.
-               True fp32 gives 24. The Hopper fp8 MMA datapath gives ~14.
-
-Values are carried on the integer grid q = 2*value, so C1 and C2 are exact
-integers and the split is well defined. q is in {0,+-1,+-2,+-3,+-4,+-6,+-8,+-12},
-so |q1*q2| <= 144 and |dot| <= 144*K.
-
-Kernels here always leave the accumulator PACKED (one fp32 tile). Splitting is
-a host-side op -- keeping it out of the kernel is the point: the packed kernel
-must write half as many bytes as the separate one, or there is no win to have.
+Kernels leave the accumulator packed and split on the host, so the packed
+kernel writes half the bytes of the separate one.
 """
 
 import math

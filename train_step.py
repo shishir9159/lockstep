@@ -4,45 +4,25 @@
     dX_i = dY_i @ W                       dgrad     (W shared)
     dW   = dY1^T @ X1 + dY2^T @ X2        wgrad     (the two results are SUMMED)
 
-Three directions, three different relationships between the microbatches, and
-only one of them is a reduction. That is the point of running this:
-
-  fwd, dgrad   two results that must stay separate, sharing an operand
-  wgrad        two results that get added -- this is your reduction
-
-FWD / DGRAD ladder (all Triton, fp32 accumulator, fp32 out, so the only thing
-that varies is the technique -- comparing a packed Triton kernel against cuBLAS
-would measure Triton-vs-cuBLAS instead):
+Only wgrad is a reduction; fwd and dgrad share W, so they are one GEMM with a
+taller M. fwd/dgrad variants (all Triton, fp32 accumulate and output, so only
+the technique varies):
 
   2 launches     gemm(a1,b) ; gemm(a2,b)          2 kernels, 2 accumulators
   fused 2-acc    dual_separate                    1 kernel,  2 accumulators
-  packed 1-acc   dual_packed(a1, 2^s*a2, b, b)    1 kernel,  1 accumulator  <- your idea
-  concat         gemm(cat[a1;a2], b)              1 kernel,  1 acc, M doubled
-  preadd         gemm(a1 + 2^s*a2, b)             1 kernel,  1 acc, HALF THE MACs
+  packed 1-acc   dual_packed(a1, 2^s*a2, b, b)    1 kernel,  1 accumulator
+  concat         gemm(cat[a1;a2], b)              1 kernel,  M doubled
+  preadd         gemm(a1 + 2^s*a2, b)             1 kernel,  half the MACs
 
-`preadd` is the only variant that removes work rather than moving it: because W
-is shared, (X1 + 2^s X2) @ W^T = Y1 + 2^s Y2 in one GEMM of the ORIGINAL size,
-not a doubled one. It is also the first to die -- the packed operand needs
-bits(12) + s + 1 significand bits (19 at K=32, more at real widths) against 8 in
-bf16 and 11 in fp16.
+`preadd` is the only variant that removes work, and the first to fail: its
+operand needs bits(12) + s + 1 significand bits (19 at K=32; bf16 has 8, fp16
+11). wgrad is timed on cuBLAS for both variants (2 GEMMs + add vs 1 GEMM over
+concatenated K), since there only the op count differs. Every variant is
+checked against an exact integer reference. The packed accumulator fits fp32
+only for K <= 14, below the kernels' minimum K of 64; bench.py covers that
+regime by zero-padding.
 
-WGRAD is measured on cuBLAS for both variants, because there the question is
-purely op count -- 2 GEMMs plus an explicit add, versus 1 GEMM whose single
-accumulator performs the sum -- and routing it through Triton would only add a
-transposed-operand penalty that has nothing to do with the technique.
-
-Every variant is checked against an exact integer reference, so a variant that
-is fast because it is wrong shows up as wrong.
-
-    python train_step.py
-    python train_step.py --shape 4096 4096 4096
-    python train_step.py --dtype float16         # 11 mantissa bits instead of 8
-
-Note on the working regime: the packed accumulator needs 2*ceil(log2(144K))+1
-bits, so it fits in fp32 only for K <= 14 -- below the 64 the kernels require as
-a minimum contraction depth. No realistic layer width is in that regime, which
-is the finding, not a harness limitation. bench.py demonstrates the regime where
-it IS exact by zero-padding a logical K of 8-32 out to a physical 64.
+    uv run train_step.py [--shape B CIN COUT] [--dtype float16]
 """
 
 import argparse
@@ -55,10 +35,7 @@ import fp4
 
 def q_tensor(shape, dev):
     """Values on the FP4 integer grid q = 2*value, so all results are integers."""
-    pick = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
-                        device=dev, dtype=torch.uint8)
-    codes = pick[torch.randint(0, 15, shape, device=dev)]
-    return fp4.codes_to_q(codes).float()
+    return fp4.codes_to_q(fp4.random_codes(shape, dev)).float()
 
 
 def bench(fn):

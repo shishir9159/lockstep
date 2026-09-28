@@ -34,11 +34,18 @@ E2M1_Q = torch.tensor([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
                       dtype=torch.int32)
 
 
+def random_codes(shape, device="cpu") -> torch.Tensor:
+    """Uniform over the 15 distinct E2M1 codes (negative zero excluded)."""
+    pick = torch.tensor([c for c in range(16) if c != 8], device=device, dtype=torch.uint8)
+    return pick[torch.randint(0, 15, shape, device=device)]
+
+
 def _round_to_e2m1(q: torch.Tensor) -> torch.Tensor:
     """Round-to-nearest onto the E2M1 grid.  Returns 4-bit codes as uint8.
 
-    Ties round away from zero (not to even) -- fine for a research harness, but
-    note it if you are chasing bit-parity with a specific vendor kernel.
+    Ties go to the smaller magnitude (bucketize is right-closed), matching
+    rig_sm75/quant_sim.cuh. OCP MX specifies ties-to-even, so do not expect
+    bit-parity with a vendor kernel on exact midpoints.
     """
     mags = torch.tensor(_E2M1_MAG, device=q.device, dtype=torch.float32)
     mid = (mags[1:] + mags[:-1]) * 0.5                          # 7 midpoints

@@ -1,9 +1,9 @@
 """H100 driver: correctness + throughput for both experiments.
 
-    python bench.py                # everything
-    python bench.py --only mxfp4
-    python bench.py --only dual
-    python bench.py --shape 8192 8192 8192
+    uv run bench.py                # everything
+    uv run bench.py --only mxfp4
+    uv run bench.py --only dual
+    uv run bench.py --shape 8192 8192 8192
 """
 
 import argparse
@@ -27,14 +27,6 @@ def bench(fn, **kw):
     return triton.testing.do_bench(fn, warmup=25, rep=100, **kw)
 
 
-def random_fp4_codes(shape, device):
-    """Uniform over the 15 distinct E2M1 codes (skips the -0 duplicate)."""
-    pick = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
-                        device=device, dtype=torch.uint8)
-    idx = torch.randint(0, 15, shape, device=device)
-    return pick[idx]
-
-
 # --------------------------------------------------------------------------- #
 def run_mxfp4(M, N, K):
     section(f"1. MXFP4 GEMM emulated on FP8 tensor cores   (M={M} N={N} K={K})")
@@ -44,8 +36,8 @@ def run_mxfp4(M, N, K):
     # 4 blocks x 4608 quarter-units = 18432 -> 15 bits, still exact in fp32 once
     # each 32-block has been promoted out of the 14-bit MMA accumulator.
     m0, n0, k0 = 256, 256, 128
-    ca = random_fp4_codes((m0, k0), dev)
-    cb = random_fp4_codes((k0, n0), dev)
+    ca = fp4.random_codes((m0, k0), dev)
+    cb = fp4.random_codes((k0, n0), dev)
     sa = torch.ones((m0, k0 // 32), device=dev, dtype=torch.float32)
     sb = torch.ones((k0 // 32, n0), device=dev, dtype=torch.float32)
     got = mxfp4_gemm_fp8(fp4.codes_to_e4m3(ca), fp4.codes_to_e4m3(cb), sa, sb,
@@ -54,7 +46,7 @@ def run_mxfp4(M, N, K):
     qb = fp4.codes_to_q(cb).double()
     exact = (qa @ qb) / 4.0
     nbad = (got.double() != exact).sum().item()
-    print(f"  bit-exactness (K=64, unit scales): {nbad} of {m0*n0} elements differ "
+    print(f"  bit-exactness (K={k0}, unit scales): {nbad} of {m0*n0} elements differ "
           f"-> {'EXACT' if nbad == 0 else 'LOSSY'}")
     print("  (13-bit worst case per 32-block vs the ~14-bit Hopper FP8 accumulator)")
 
@@ -136,7 +128,7 @@ def run_dual(M, N, K):
         kp = max(64, (k + 63) // 64 * 64)
         q = []
         for sh, axis in (((m, k), 1), ((m, k), 1), ((k, n), 0), ((k, n), 0)):
-            v = fp4.codes_to_q(random_fp4_codes(sh, dev)).float()
+            v = fp4.codes_to_q(fp4.random_codes(sh, dev)).float()
             if kp != k:
                 pad = torch.zeros((m, kp - k) if axis == 1 else (kp - k, n), device=dev)
                 v = torch.cat([v, pad], dim=axis)

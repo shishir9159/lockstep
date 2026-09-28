@@ -14,28 +14,12 @@
 //   SB  [K/32, N]   fp32
 //   C   [M, N]      fp32
 //
-// READ THIS BEFORE JUDGING THE THROUGHPUT NUMBER.
-//
-// This kernel is a readable *reference* for the block-scaled mainloop, not the
-// fast path. Disassembling it for sm_90a shows why:
-//
-//     32 x HMMA.16816.F32          <- FP16 tensor core, k=16
-//     48 x F2FP.F16.E4M3.UNPACK_B  <- FP8 -> FP16 conversion
-//
-// There are 16 mma.sync per k-step in this kernel, so ptxas turned each
-// m16n8k32 e4m3 MMA into TWO FP16 m16n8k16 MMAs plus conversions. On Hopper the
-// warp-level mma.sync FP8 path is emulated on the FP16 datapath; only the
-// warp-group instruction (wgmma.mma_async ... .e4m3) reaches the native FP8
-// tensor core and the 1979 TFLOP/s rate. That is why CUTLASS, DeepGEMM and
-// Triton all use wgmma on sm_90.
-//
-// So: this file is for understanding and for correctness. For throughput use
-// ../mxfp4_gemm.py (Triton emits wgmma) and run `python check_isa.py` to
-// confirm which datapath your build actually picked. Porting this mainloop to
-// wgmma means replacing the fragment loads with 64-bit SMEM matrix descriptors
-// and a swizzled shared layout; the surrounding structure -- one MXFP4 block
-// per iteration, scale-multiply into a separate FP32 accumulator -- is what is
-// worth copying and does not change.
+// A readable reference, not the fast path: on sm_90a ptxas lowers each
+// mma.sync m16n8k32 e4m3 to two HMMA.16816 plus F2FP conversions (the FP16
+// datapath); only wgmma reaches the FP8 rate. Use ../mxfp4_gemm.py for speed
+// and `just sass` / `uv run check_isa.py` to see which path was picked. A wgmma
+// port keeps this structure: one MXFP4 block per iteration, scales applied
+// when promoting into a separate fp32 accumulator.
 //
 //   nvcc -O3 -arch=sm_90a -o mxfp4 mxfp4_mma_gemm.cu
 //   ./mxfp4 --check          # correctness against a double-precision reference

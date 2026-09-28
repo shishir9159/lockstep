@@ -5,33 +5,39 @@ emulated: ptxas converts to FP16 and issues HMMA, so you get FP16 rate minus the
 conversions. Only `wgmma.mma_async` reaches the native FP8 tensor core. Run this
 before believing any FP4-on-Hopper throughput number.
 
-    python check_isa.py
+    uv run check_isa.py
 """
 
 import re
 import torch
+from triton.runtime.jit import JITFunction
 
 import fp4
 from mxfp4_gemm import _mxfp4_gemm_fp8_kernel, mxfp4_gemm_fp8
 from dual_gemm import _dual_packed_kernel, dual_packed
 
 
-def _kernels(jit_fn):
-    """Compiled variants sitting in the JIT cache, newest first."""
-    out = []
-    cache = getattr(jit_fn, "cache", {})
-    for per_device in cache.values():
-        out.extend(per_device.values())
-    return out
+def _kernels(fn):
+    """Every compiled variant of a Triton kernel, including autotuned ones.
+
+    @autotune wraps the JITFunction (its own .cache maps tuning keys to Configs,
+    not kernels), and the JIT cache moved from .cache to .device_caches in 3.2.
+    """
+    while not isinstance(fn, JITFunction):
+        fn = fn.fn
+    caches = getattr(fn, "device_caches", None)
+    if caches is not None:
+        return [k for entry in caches.values() for k in entry[0].values()]
+    return [k for per_device in fn.cache.values() for k in per_device.values()]
 
 
 def report(name, jit_fn):
+    """Print the MMA instructions found across every compiled variant."""
     ks = _kernels(jit_fn)
     if not ks:
         print(f"  {name}: nothing compiled")
         return
-    k = ks[-1]
-    ptx = k.asm.get("ptx", "")
+    ptx = "\n".join(k.asm.get("ptx", "") for k in ks)
     mma = sorted(set(re.findall(r"\b(?:wgmma\.mma_async|mma)\.[a-z0-9_.]+", ptx)))
     mma = [m for m in mma if "fence" not in m and "commit" not in m and "wait" not in m]
     print(f"  {name}")
