@@ -1,230 +1,137 @@
-# intra-gpu-reduction
-#
-#   just              list recipes
-#   just rig          experiments [1]-[5]: does the packing idea work at all?
-#   just rig-q        experiments [6]-[19]: quantization formats and transport
-#   just h100         the Hopper experiments (needs an H100)
-#
-# Every recipe says what QUESTION its experiment answers. Most of them exist to
-# control a claim an earlier version of this repo got wrong, so the goal line
-# matters as much as the code.
+# Each recipe's comment is the question it answers. Results: FINDINGS.md and
+# rig_sm75/README.md. On Windows set CCBIN to MSVC's Hostx64/x64 first.
 
 set windows-shell := ["bash", "-c"]
 
-# MSVC is only needed on Windows; on Linux leave CCBIN empty.
 ccbin := env_var_or_default("CCBIN", "")
 nvcc_flags := "-O3 -std=c++17" + if ccbin != "" { " -ccbin \"" + ccbin + "\"" } else { "" }
+arch := "sm_75"          # override: just arch=sm_90a rig
 
 _default:
-    @just --list
+    @just --list --unsorted
 
-# Builds for sm_75 by default. Override: just arch=sm_90a rig
-arch := "sm_75"
-
-# Build both portable binaries (rig, rig_q)
+# Build both portable rigs
 build:
     nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig rig_sm75/rig.cu
     nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig_q rig_sm75/rig_q.cu
 
-# ------------------------------------------------- [1]-[5]  does the idea work?
+# [1]-[5], or one of: unpack bits reduce gemm splitk
+rig name="": build
+    ./rig_sm75/rig {{name}}
 
-# [1]-[5]: unpack, bit budget, reduction traffic, fwd/bwd attribution, split-K
-rig: build
-    ./rig_sm75/rig
+# [6]-[19], or one experiment by name
+rig-q name="": build
+    ./rig_sm75/rig_q {{name}}
 
-# GOAL: prove FP4 -> FP8 costs no accuracy, only two PRMT. Exhaustive over 16^4.
-# [1] is the FP4 -> FP8 expansion lossless?
+# [1] Is FP4 -> FP8 via prmt lossless? (exhaustive)
 unpack: build
     ./rig_sm75/rig unpack
 
-# GOAL: kill or confirm accumulator-packing with arithmetic instead of opinion.
-# Answer: 27 bits at K=32, against fp32's 24 and the Hopper FP8 path's ~14.
-# [2] how many significand bits does a packed dual dot product need?
+# [2] How many accumulator bits does a packed dual dot product need?
 bits: build
     ./rig_sm75/rig bits
 
-# GOAL: measure the honest UPPER BOUND on what halving partials can ever buy,
-# with nothing else in the way.
-# [3] split-K reduction traffic, 1 accumulator vs 2
+# [3] Upper bound: what does halving split-K accumulators buy?
 reduce: build
     ./rig_sm75/rig reduce
 
-# GOAL: attribution. An earlier version reported 1.85x for packing; adding the
-# fused control showed the win was entirely operand reuse. Never drop a control.
-# [4] minimal fwd + wgrad: 2 launches / concat / fused-2-acc / packed-1-acc
+# [4] Is the fwd speedup packing, or loading the shared operand once?
 gemm: build
     ./rig_sm75/rig gemm
 
-# GOAL: the repaired idea -- packing as TRANSPORT, never as accumulation, with
-# partials going to memory for a second kernel instead of to atomics.
-# [5] split-K storing packed int16 partials
+# [5] Do packed int16 partials work as a split-K transport format?
 splitk: build
     ./rig_sm75/rig splitk
 
-# --------------------------------------------- [6]-[14]  formats and transport
-
-# [6]-[19]: formats, controls, the interconnect, scale, feedback, MoE, the full chain
-rig-q: build
-    ./rig_sm75/rig_q
-
-# GOAL: the control [5] was missing. Both int16 rows move IDENTICAL bytes, so a
-# gap between them is the pairing alone and a gap to int32x2 is the narrowing.
-# Decides whether the write-up says "packing" or "narrowing".
-# [6] int32x2 vs int16x2 vs packed-int16 -- packing or narrowing?
+# [6] Is [5]'s win the pairing, or just 16-bit partials?
 narrow: build
     ./rig_sm75/rig_q narrow
 
-# GOAL: separate the ACCUMULATOR question from the OPERAND question, so we learn
-# which one actually kills packed accumulation. INT8 is the only Hopper datapath
-# with a true 32-bit integer accumulator (fp32 has 24 significand bits, FP8 ~14).
-# Prints a worst-case column beside the observed one so random-data success
-# cannot be mistaken for a guarantee.
-# [7] INT8/s32 -- is the accumulator the problem, or the operand?
+# [7] Is the accumulator or the operand lane the wall for packing?
 int8acc: build
     ./rig_sm75/rig_q int8acc
 
-# GOAL: accuracy per bit on clean and outlier-heavy data, and which of the two
-# axes -- block size or scale format -- is actually doing the work.
-# [8] MXFP4 (block 32, E8M0) vs NVFP4 (block 16, E4M3)
+# [8] MXFP4 vs NVFP4: accuracy per bit, clean and with outliers
 nvfp4: build
     ./rig_sm75/rig_q nvfp4
 
-# GOAL: on Hopper all of these run at the SAME FLOP rate, because MXFP4 is
-# emulated onto the FP8 datapath. So price the 4-bit formats honestly: what does
-# the halved byte count actually cost in accuracy?
-# [9] MXFP4 vs NVFP4 vs MXFP8 vs BF16 against an fp64 reference
+# [9] What does 4-bit buy over MXFP8/BF16 at equal FLOPs?
 mxfp8: build
     ./rig_sm75/rig_q mxfp8
 
-# GOAL: byte counts are EQUAL by construction -- FP4 is already 2 per byte -- so
-# this isolates locality from bandwidth, and must not be reported as bandwidth.
-# [10] nibble-interleave A1/A2: one load stream for two microbatches
+# [10] Does one nibble-interleaved stream beat two FP4 arrays?
 interleave: build
     ./rig_sm75/rig_q interleave
 
-# GOAL: the reason for the whole project. Integer addition is associative, so a
-# fixed-point payload rounds ONCE regardless of rank count while bf16 and fp8
-# round at every hop. Tests whether that beats bf16 at equal bytes, and what the
-# a-priori 144*d bound costs against one scalar all-reduce of the real amax.
-# [11] inter-GPU reduction: measured off-chip bandwidth + a P-rank ring all-reduce
+# [11] Does off-chip time scale with payload bytes?
 link: build
     ./rig_sm75/rig_q link
 
-# GOAL: if the consumer normalizes after the reduction, partials have to survive
-# the SUM, not survive individually. Measures how much denser than exact int16
-# you can get and what each step of density costs.
-# [12] normalization-aware packing: a-priori bound, exception path, MX partials
+# [12] How dense can partials get if the result is normalized?
 dense: build
     ./rig_sm75/rig_q dense
 
-# GOAL: control [11], which reported 39x for int16 over bf16 and blamed
-# associativity. Its own error-vs-P columns contradict that. This runs the
-# baseline [11] skipped -- fp16 with a per-tensor scale, same 2 bytes -- and
-# runs ONE format both ways, encoded once vs re-encoded at every hop, so the
-# bits effect and the closure effect are separated instead of summed.
-# [13] is the 39x bits or associativity? run the baseline [11] never ran
+# [13] At equal bytes, what are closure, bits and topology each worth?
 fair: build
     ./rig_sm75/rig_q fair
 
-# GOAL: everything so far ran at 4096 elements, K=256, P<=128. A 1B model
-# all-reduces 1e9 elements with K in the thousands over hundreds of ranks.
-# Prices the three things that get worse in that direction: the a-priori bound
-# loosening as sqrt(K*P), a single global amax dying on heavy tails, and the
-# extra collective needed to agree per-chunk scales across ranks.
-# [14] does the fixed-point wire survive 1B/7B/70B/405B parameters?
+# [14] Does the integer wire survive 1B-405B parameters?
 llm: build
     ./rig_sm75/rig_q llm
 
-# ---------------------------------------------- [15]-[17]  the multi-step ideas
-
-# GOAL: [13] found an int8 wire 5x WORSE than bf16 at half the bytes, which was
-# the wall. Error feedback keeps the rounding residual in a local buffer and
-# adds it to next step's gradient, so nothing is permanently lost, only delayed.
-# It belongs here rather than as a citation because on a fixed-point grid the
-# residual is EXACT -- on a float wire the correction you carry forward has
-# itself been rounded. Measures accumulated error, not per-step, since that is
-# what an optimizer integrates.
-# [15] error feedback: does it make a 1-byte gradient wire usable?
+# [15] Does error feedback make a 1-byte wire usable over many steps?
 ef: build
     ./rig_sm75/rig_q ef
 
-# GOAL: [14] found the block-scaled design costs negligible bytes but a real
-# latency round trip -- two dependent collectives where bf16 needs one. Gradient
-# amax moves slowly, so last step's value plus a margin should work with no
-# communication at all. The real question is what happens when it underpredicts:
-# a clipped value leaves a residual, and [15] already built the machine that
-# carries residuals forward, so the exception path may just BE error feedback.
-# [16] scale prediction: can the extra collective come off the critical path?
+# [16] Can last step's grid replace the scale collective?
 predict: build
     ./rig_sm75/rig_q predict
 
-# GOAL: every experiment so far treated the ranks as one flat ring. Real
-# clusters are 8 GPUs on NVLink inside a node and ~10x slower between nodes.
-# Two questions: does quantizing once at the source make a hierarchy return
-# BIT-IDENTICAL results to a flat ring (closure says it must), and is the
-# sqrt(L) accuracy from quantizing per-node instead of per-rank worth the
-# intra-node bandwidth it costs? The time model answers the second one no.
-# [17] hierarchical reduction: where the roundings go, and what they cost
+# [17] Two-level NVLink + IB reduction: numerics and time
 tiers: build
     ./rig_sm75/rig_q tiers
 
-# GOAL: everything from [11] to [17] assumes an all-REDUCE, where P values are
-# summed on the wire. MoE is dominated by all-to-ALL, which sums nothing in
-# flight. Tests which of the three ideas survive: the bits argument (it does),
-# closure (it does not -- its value scales with additions on the wire, and an
-# a2a has zero), and error feedback (only after re-deriving it around the index
-# the router cannot move, which is the expert channel and not the token slot).
-# [18] MoE all-to-all: which parts of the wire story actually transfer?
+# [18] Which ideas transfer to an MoE all-to-all?
 moe: build
     ./rig_sm75/rig_q moe
 
-# GOAL: can a value stay an INTEGER from GEMM output through split-K and across
-# the wire, with no dequantize anywhere? MXFP4's power-of-two scale makes it
-# possible (a shift, not a multiply) where NVFP4's E4M3 scale does not -- which
-# puts this in direct conflict with the recommendation in [8]. Also finds where
-# fp32 accumulation stops being exact, which turns out to be outside the
-# operating range, making the on-GPU half of this a negative result.
-# [19] end-to-end integral: GEMM -> split-K -> wire, no float in between
+# [19] Does keeping partials integral inside the GEMM buy anything?
 chain: build
     ./rig_sm75/rig_q chain
 
-# Host-only exhaustive check of the FP4 table, no GPU needed
-test-unpack:
+# CPU tests (pytest) and the exhaustive FP4 table check; no GPU needed
+test:
+    uv run pytest
     cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
-    ./cuda/test_unpack
+    ./cuda/test_unpack > /dev/null && echo "test_unpack: 0 mismatches"
 
-# ------------------------------------------------------------------ H100 side
+lint:
+    uv run ruff check .
 
-h100-build:
+# Hopper block-scaled GEMM: correctness, then 4096^3 throughput (sm_90a)
+h100:
     nvcc {{nvcc_flags}} -arch=sm_90a -o cuda/mxfp4 cuda/mxfp4_mma_gemm.cu
-
-# The Hopper block-scaled GEMM: correctness then throughput (needs an H100)
-h100: h100-build
     ./cuda/mxfp4 --check
     ./cuda/mxfp4 4096 4096 4096
 
-# Which tensor-core datapath did ptxas actually pick? (wgmma vs emulated mma.sync)
+# Which tensor-core path did ptxas pick for the CUDA kernel?
 sass:
     nvcc {{nvcc_flags}} -arch=sm_90a --resource-usage -cubin -o cuda/mxfp4.cubin cuda/mxfp4_mma_gemm.cu
     cuobjdump -sass cuda/mxfp4.cubin | grep -oE "HMMA[^ ]*|QGMMA[^ ]*|HGMMA[^ ]*|F2FP[^ ]*|LDGSTS[^ ]*" | sort | uniq -c
 
-# One Linear layer, fwd + bwd, vanilla vs the technique (Triton, needs an H100)
-train:
-    uv run train_step.py
-
-# Both Hopper experiments at 4096^3 (Triton, needs an H100)
+# Triton: both H100 experiments at 4096^3
 bench:
     uv run bench.py
 
-# Confirm which tensor-core path Triton selected (needs an H100)
+# Triton: one Linear layer fwd + bwd, vanilla vs packed
+train:
+    uv run train_step.py
+
+# Triton: did the FP4 kernel get wgmma?
 isa:
     uv run check_isa.py
 
-lint:
-    uvx ruff check .
-
 clean:
-    rm -f rig_sm75/rig rig_sm75/rig.exe rig_sm75/rig_q rig_sm75/rig_q.exe
-    rm -f cuda/mxfp4 cuda/mxfp4.exe cuda/mxfp4.cubin
-    rm -f cuda/test_unpack cuda/test_unpack.exe cuda/*.obj rig_sm75/*.obj
-    rm -rf __pycache__ .ruff_cache
+    rm -f rig_sm75/rig rig_sm75/rig_q rig_sm75/*.exe rig_sm75/*.exp rig_sm75/*.lib rig_sm75/*.obj
+    rm -f cuda/mxfp4 cuda/mxfp4.exe cuda/mxfp4.cubin cuda/*.obj cuda/test_unpack cuda/test_unpack.exe
+    rm -rf __pycache__ tests/__pycache__ .ruff_cache .pytest_cache
