@@ -43,6 +43,7 @@ struct Timer {
     float stop() {
         cudaEventRecord(b);
         cudaEventSynchronize(b);
+        CHECK(cudaGetLastError());            // a failed launch must not time as zero
         float ms = 0.f;
         cudaEventElapsedTime(&ms, a, b);
         return ms;
@@ -1698,6 +1699,9 @@ static void exp_chain() {
     printf("    (the aligned integer path is exact by construction in every row)\n");
 }
 
+// Fails fast when this binary has no kernel image for the GPU it runs on.
+__global__ void probe() {}
+
 int main(int argc, char **argv) {
     struct { const char *name; void (*fn)(); } exps[] = {
         {"narrow", exp_narrow}, {"int8acc", exp_int8acc}, {"nvfp4", exp_nvfp4},
@@ -1717,6 +1721,8 @@ int main(int argc, char **argv) {
     CHECK(cudaGetDeviceProperties(&p, 0));
     printf("%s  sm_%d%d  %.1f GiB  %d SMs\n", p.name, p.major, p.minor,
            p.totalGlobalMem / 1073741824.0, p.multiProcessorCount);
+    probe<<<1, 1>>>();
+    CHECK(cudaGetLastError());
     for (auto &e : exps)
         if (!only || !strcmp(only, e.name)) {
             rng.seed(20260909);

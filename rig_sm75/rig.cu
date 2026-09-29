@@ -33,6 +33,7 @@ struct Timer {
     float stop() {
         cudaEventRecord(b);
         cudaEventSynchronize(b);
+        CHECK(cudaGetLastError());            // a failed launch must not time as zero
         float ms = 0.f;
         cudaEventElapsedTime(&ms, a, b);
         return ms;
@@ -662,6 +663,9 @@ static void exp_splitk() {
     cudaFree(c1); cudaFree(c2); cudaFree(atom); cudaFree(part);
 }
 
+// Fails fast when this binary has no kernel image for the GPU it runs on.
+__global__ void probe() {}
+
 int main(int argc, char **argv) {
     struct { const char *name; void (*fn)(); } exps[] = {
         {"unpack", [] { exp_unpack(); }}, {"bits", exp_bits}, {"reduce", exp_reduce},
@@ -679,6 +683,8 @@ int main(int argc, char **argv) {
     CHECK(cudaGetDeviceProperties(&p, 0));
     printf("%s  sm_%d%d  %.1f GiB  %d SMs\n", p.name, p.major, p.minor,
            p.totalGlobalMem / 1073741824.0, p.multiProcessorCount);
+    probe<<<1, 1>>>();
+    CHECK(cudaGetLastError());
     for (auto &e : exps)
         if (!only || !strcmp(only, e.name)) {
             rng.seed(12345);        // each experiment reproduces standalone
