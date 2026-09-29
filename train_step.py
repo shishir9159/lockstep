@@ -31,6 +31,7 @@ import triton
 
 import dual_gemm as dg
 import fp4
+from h100 import require_h100
 
 
 def q_tensor(shape, dev):
@@ -83,7 +84,7 @@ def main():
     dt = getattr(torch, args.dtype)
     dev = "cuda"
 
-    prop = torch.cuda.get_device_properties(0)
+    prop = require_h100()
     print(f"{prop.name} sm_{prop.major}{prop.minor}   "
           f"B={B} Cin={CIN} Cout={COUT}  {args.dtype}\n")
 

@@ -13,6 +13,7 @@ import torch
 from triton.runtime.jit import JITFunction
 
 import fp4
+from h100 import require_h100
 from mxfp4_gemm import _mxfp4_gemm_fp8_kernel, mxfp4_gemm_fp8
 from dual_gemm import _dual_packed_kernel, dual_packed
 
@@ -49,8 +50,7 @@ def report(name, jit_fn):
 
 
 def main():
-    assert torch.cuda.is_available()
-    p = torch.cuda.get_device_properties(0)
+    p = require_h100()
     print(f"{p.name} sm_{p.major}{p.minor}\n")
 
     M = N = K = 1024

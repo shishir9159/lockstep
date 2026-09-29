@@ -11,6 +11,7 @@ import torch
 import triton
 
 import fp4
+from h100 import require_h100
 from mxfp4_gemm import mxfp4_gemm_fp8, mxfp4_gemm_packed
 import dual_gemm as dg
 
@@ -185,13 +186,10 @@ def main():
                    metavar=("M", "N", "K"))
     args = p.parse_args()
 
-    assert torch.cuda.is_available(), "needs a GPU"
-    props = torch.cuda.get_device_properties(0)
+    props = require_h100()
     print(f"{props.name}  sm_{props.major}{props.minor}  "
           f"{props.total_memory/2**30:.0f} GiB  torch {torch.__version__}  "
           f"triton {triton.__version__}")
-    if props.major != 9:
-        print("WARNING: not Hopper. The 14-bit FP8 accumulator claim is Hopper-specific.")
 
     M, N, K = args.shape
     if args.only in (None, "mxfp4"):

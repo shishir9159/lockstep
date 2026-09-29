@@ -302,8 +302,11 @@ int main(int argc, char **argv) {
     }
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, 0));
+    if (p.major != 9 || p.minor != 0 || !strstr(p.name, "H100")) {
+        fprintf(stderr, "needs an H100: found %s (sm_%d%d)\n", p.name, p.major, p.minor);
+        return 1;
+    }
     printf("%s  sm_%d%d\n", p.name, p.major, p.minor);
-    if (p.major != 9) printf("  WARNING: not Hopper; the 14-bit FP8 accumulator note is Hopper-specific\n");
     run(M, N, K, check);
     return 0;
 }

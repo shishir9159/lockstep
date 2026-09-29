@@ -108,28 +108,61 @@ test:
 lint:
     uv run ruff check .
 
-# Hopper block-scaled GEMM: correctness, then 4096^3 throughput (sm_90a)
-h100:
+# ------------------------------------------------ H100 only: each recipe checks GPU 0
+
+# Exit unless GPU 0 is an H100 (sm_90)
+[private]
+h100-guard:
+    #!/usr/bin/env bash
+    gpu=$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader -i 0 2>/dev/null)
+    case "$gpu" in
+        *H100*", 9.0") echo "$gpu" ;;
+        *) echo "needs an H100; found: ${gpu:-no NVIDIA GPU}" >&2; exit 1 ;;
+    esac
+
+# Driver, nvcc, torch and triton versions
+h100-env: h100-guard
+    nvidia-smi --query-gpu=driver_version,memory.total --format=csv,noheader -i 0
+    nvcc --version | tail -1
+    uv run python -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__)"
+
+# CUDA block-scaled GEMM: bit-exactness, then 4096^3 throughput
+h100: h100-guard
     nvcc {{nvcc_flags}} -arch=sm_90a -o cuda/mxfp4 cuda/mxfp4_mma_gemm.cu
     ./cuda/mxfp4 --check
     ./cuda/mxfp4 4096 4096 4096
 
-# Which tensor-core path did ptxas pick for the CUDA kernel?
+# Which tensor-core instructions ptxas emitted (HMMA = FP16 path, QGMMA = FP8 wgmma)
 sass:
     nvcc {{nvcc_flags}} -arch=sm_90a --resource-usage -cubin -o cuda/mxfp4.cubin cuda/mxfp4_mma_gemm.cu
     cuobjdump -sass cuda/mxfp4.cubin | grep -oE "HMMA[^ ]*|QGMMA[^ ]*|HGMMA[^ ]*|F2FP[^ ]*|LDGSTS[^ ]*" | sort | uniq -c
 
-# Triton: both H100 experiments at 4096^3
-bench:
+# Triton: MXFP4 exactness and throughput, then the packed dual GEMM
+bench: h100-guard
     uv run bench.py
 
 # Triton: one Linear layer fwd + bwd, vanilla vs packed
-train:
+train: h100-guard
     uv run train_step.py
 
 # Triton: did the FP4 kernel get wgmma?
-isa:
+isa: h100-guard
     uv run check_isa.py
+
+# The portable rigs, rebuilt for sm_90a
+h100-rig: h100-guard
+    {{just_executable()}} arch=sm_90a rig
+    {{just_executable()}} arch=sm_90a rig-q
+
+# Everything above in order, logged to results/h100-<time>.log
+h100-all: h100-guard
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p results
+    log="results/h100-$(date +%Y%m%d-%H%M%S).log"
+    j={{just_executable()}}
+    { $j h100-env; $j test; $j h100; $j sass; $j isa; $j bench; $j train; $j h100-rig; } 2>&1 | tee "$log"
+    echo "log: $log"
 
 clean:
     rm -f rig_sm75/rig rig_sm75/rig_q rig_sm75/*.exe rig_sm75/*.exp rig_sm75/*.lib rig_sm75/*.obj
