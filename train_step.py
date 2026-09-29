@@ -22,10 +22,11 @@ checked against an exact integer reference. The packed accumulator fits fp32
 only for K <= 14, below the kernels' minimum K of 64; bench.py covers that
 regime by zero-padding.
 
-    uv run train_step.py [--shape B CIN COUT] [--dtype float16]
+    uv run train_step.py [--shape B CIN COUT] [--dtype float16] [--json out.json]
 """
 
 import argparse
+import json
 import torch
 import triton
 
@@ -79,6 +80,7 @@ def main():
     p.add_argument("--shape", nargs=3, type=int, default=[4096, 4096, 4096],
                    metavar=("B", "CIN", "COUT"))
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    p.add_argument("--json", help="also write the results to this file")
     args = p.parse_args()
     B, CIN, COUT = args.shape
     dt = getattr(torch, args.dtype)
@@ -184,6 +186,14 @@ def main():
     print("  wgrad is the only reduction here. fwd/dgrad share W, so they were")
     print("  never two problems -- they are one GEMM with a taller M, which is")
     print("  what `concat` does for free and exactly.")
+    if args.json:
+        out = {"device": prop.name, "shape": [B, CIN, COUT], "dtype": args.dtype,
+               "fwd_exact": {n.strip(): v for n, v in checks},
+               "wgrad_rel_err": {"vanilla": relv, "concat": relc},
+               "rows": [{"pass": d, "name": n, "ms": ms, "tflops": fl / (ms * 1e-3) / 1e12,
+                         "speedup": base[d] / ms} for d, n, ms, fl in rows]}
+        with open(args.json, "w") as f:
+            json.dump(out, f, indent=1)
 
 
 if __name__ == "__main__":

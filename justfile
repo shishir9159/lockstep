@@ -154,15 +154,38 @@ h100-rig: h100-guard
     {{just_executable()}} arch=sm_90a rig
     {{just_executable()}} arch=sm_90a rig-q
 
-# Everything above in order, logged to results/h100-<time>.log
+# Everything above into results/<time>/: log, JSON, charts, report.html, tarball
 h100-all: h100-guard
     #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p results
-    log="results/h100-$(date +%Y%m%d-%H%M%S).log"
-    j={{just_executable()}}
-    { $j h100-env; $j test; $j h100; $j sass; $j isa; $j bench; $j train; $j h100-rig; } 2>&1 | tee "$log"
-    echo "log: $log"
+    set -uo pipefail
+    out="results/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$out"
+    j="{{just_executable()}}"
+    step() { local name=$1; shift; printf '\n== %s\n' "$name"; "$@" || echo "$name" >> "$out/failed.txt"; }
+    {
+        step env   "$j" h100-env
+        step test  "$j" test
+        step cuda  "$j" h100
+        step sass  "$j" sass
+        step isa   uv run check_isa.py
+        step bench uv run bench.py --json "$out/bench.json"
+        step train uv run train_step.py --json "$out/train.json"
+        step build "$j" arch=sm_90a build
+        step rig   ./rig_sm75/rig
+        step rig_q ./rig_sm75/rig_q
+    } 2>&1 | tee "$out/run.log"
+    echo
+    uv run report.py "$out"
+    tar -czf "$out.tar.gz" -C results "$(basename "$out")"
+    host="$(whoami)@$(hostname -f 2>/dev/null || hostname)"
+    echo "fetch: scp $host:$PWD/$out.tar.gz ."
+    echo "view:  just h100-serve   (then on your machine: ssh -N -L 8000:localhost:8000 $host)"
+
+# Serve results/ on localhost; open it from your machine through an ssh tunnel
+h100-serve port="8000":
+    @echo "on your machine: ssh -N -L {{port}}:localhost:{{port}} $(whoami)@$(hostname -f 2>/dev/null || hostname)"
+    @echo "then open http://localhost:{{port}} and click into the run folder"
+    uv run python -m http.server {{port}} --bind 127.0.0.1 --directory results
 
 clean:
     rm -f rig_sm75/rig rig_sm75/rig_q rig_sm75/*.exe rig_sm75/*.exp rig_sm75/*.lib rig_sm75/*.obj

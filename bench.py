@@ -4,9 +4,11 @@
     uv run bench.py --only mxfp4
     uv run bench.py --only dual
     uv run bench.py --shape 8192 8192 8192
+    uv run bench.py --json results/bench.json
 """
 
 import argparse
+import json
 import torch
 import triton
 
@@ -26,6 +28,9 @@ def tflops(ms, M, N, K, gemms=1):
 
 def bench(fn, **kw):
     return triton.testing.do_bench(fn, warmup=25, rep=100, **kw)
+
+
+OUT = {}                                   # everything printed, for --json
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +106,10 @@ def run_mxfp4(M, N, K):
         print(f"  {name:<44}{ms:>10.3f}{tflops(ms, M, N, K):>12.1f}")
     print("\n  H100 SXM dense peaks: bf16 989 TFLOP/s, fp8 1979 TFLOP/s.")
     print("  The fp8 line is the ceiling for FP4 on Hopper -- nothing beats it.")
+    OUT["mxfp4"] = {"shape": [M, N, K], "exact_k": k0, "mismatches": nbad, "rel_err": rel,
+                    "rel_err_packed": relp,
+                    "rows": [{"name": n, "ms": ms, "tflops": tflops(ms, M, N, K)}
+                             for n, ms in rows]}
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +128,7 @@ def run_dual(M, N, K):
         g1, g2 = dg.unpack_dual(acc, s)
         return ((g1.double() == ref1) & (g2.double() == ref2)).float().mean().item()
 
+    numerics = []
     for k in [16, 32, 64, 128, 512]:
         s = dg.slot_offset(k)
         need = 2 * (144 * k).bit_length() + 1
@@ -143,8 +153,9 @@ def run_dual(M, N, K):
         a2s = q[1] * (2.0 ** s)
         rt = a2s.to(torch.float8_e4m3fn).float()
         enc = bool(torch.isfinite(rt).all().item() and (rt == a2s).all().item())
-        f8 = f"{100*exact_rate(torch.float8_e4m3fn, q, s, ref1, ref2):>11.1f}%" \
-            if enc else f"{'--':>12}"
+        f8x = exact_rate(torch.float8_e4m3fn, q, s, ref1, ref2) if enc else None
+        f8 = f"{100*f8x:>11.1f}%" if enc else f"{'--':>12}"
+        numerics.append({"k": k, "s": s, "bits": need, "bf16_exact": bf, "fp8_exact": f8x})
         print(f"  {k:>6}{s:>5}{need:>13}{100*bf:>12.1f}%"
               f"{('yes' if enc else 'NO (>448)'):>15}{f8}")
 
@@ -177,6 +188,9 @@ def run_dual(M, N, K):
         print(f"  {name:<44}{ms:>10.3f}{tflops(ms, M, N, K, gemms=2):>12.1f}")
     print("\n  Same MAC count in every row -- the only difference is accumulator")
     print("  registers and store/atomic traffic. That is the whole hypothesis.")
+    OUT["dual"] = {"shape": [M, N, K], "numerics": numerics,
+                   "rows": [{"name": n, "ms": ms, "tflops": tflops(ms, M, N, K, gemms=2)}
+                            for n, ms in rows]}
 
 
 def main():
@@ -184,6 +198,7 @@ def main():
     p.add_argument("--only", choices=["mxfp4", "dual"])
     p.add_argument("--shape", nargs=3, type=int, default=[4096, 4096, 4096],
                    metavar=("M", "N", "K"))
+    p.add_argument("--json", help="also write the results to this file")
     args = p.parse_args()
 
     props = require_h100()
@@ -196,6 +211,10 @@ def main():
         run_mxfp4(M, N, K)
     if args.only in (None, "dual"):
         run_dual(M, N, K)
+    if args.json:
+        OUT["device"] = props.name
+        with open(args.json, "w") as f:
+            json.dump(OUT, f, indent=1)
 
 
 if __name__ == "__main__":
