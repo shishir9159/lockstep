@@ -1,5 +1,6 @@
 # Each recipe's comment is the question it answers. Results: FINDINGS.md and
 # rig_sm75/README.md. On Windows set CCBIN to MSVC's Hostx64/x64 first.
+# Rented H100: `just h100-remote user@host` uploads, runs and fetches the report.
 
 set windows-shell := ["bash", "-c"]
 
@@ -177,9 +178,31 @@ h100-all: h100-guard
     echo
     uv run report.py "$out"
     tar -czf "$out.tar.gz" -C results "$(basename "$out")"
+    cp "$out.tar.gz" results/latest.tar.gz
     host="$(whoami)@$(hostname -f 2>/dev/null || hostname)"
-    echo "fetch: scp $host:$PWD/$out.tar.gz ."
+    echo "fetch: scp $host:$PWD/results/latest.tar.gz ."
     echo "view:  just h100-serve   (then on your machine: ssh -N -L 8000:localhost:8000 $host)"
+
+# From your machine: upload to a rented H100, run there detached, fetch the report
+h100-remote host dir="lockstep":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p results
+    git ls-files -z --cached --others --exclude-standard | xargs -0 tar -czf results/src.tar.gz
+    scp results/src.tar.gz {{host}}:{{dir}}.tar.gz
+    ssh {{host}} 'mkdir -p {{dir}} && tar -xzf {{dir}}.tar.gz -C {{dir}} && cd {{dir}} && { nohup bash h100.sh > h100.out 2>&1 < /dev/null & echo $! > h100.pid; }'
+    "{{just_executable()}}" h100-fetch {{host}} {{dir}}
+
+# Follow a remote run to the end (re-run after a dropped connection), then fetch
+h100-fetch host dir="lockstep":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh {{host}} 'cd {{dir}} && tail -n +1 -f --pid="$(cat h100.pid)" h100.out'
+    mkdir -p results
+    scp {{host}}:{{dir}}/results/latest.tar.gz results/h100.tar.gz
+    run=$(tar -tzf results/h100.tar.gz | sed -n '1s|/.*||p')
+    tar -xzf results/h100.tar.gz -C results
+    echo "report: results/$run/report.html (stop the instance now)"
 
 # Serve results/ on localhost; open it from your machine through an ssh tunnel
 h100-serve port="8000":

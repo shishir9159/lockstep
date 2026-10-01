@@ -220,27 +220,37 @@ def summary(bench, train, secs):
     env = secs.get("env", "").strip().splitlines()
     if env:
         out.append(f"GPU: {env[0].strip()}")
-    for line in secs.get("cuda", "").splitlines():
-        if "rel err" in line or "TFLOP/s" in line or "expansion" in line:
-            out.append(f"CUDA kernel: {line.strip()}")
-    ops = re.findall(r"^\s+(\d+)\s+([A-Z][\w.]+)$", secs.get("sass", ""), flags=re.M)
-    if ops:
-        out.append("SASS: " + ", ".join(f"{n} x {op}" for n, op in ops))
-    if m := bench.get("mxfp4"):
-        out.append(f"Triton MXFP4: {m['mismatches']} mismatches at K={m['exact_k']}, "
-                   f"max rel err {m['rel_err']:.1e}")
-        out += [f"  {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in m["rows"]]
+
+    out.append("\nTwo batches in one element (the packing idea)")
     if d := bench.get("dual"):
-        out += [f"  dual {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in d["rows"]]
-    for r in train.get("rows", []):
-        out.append(f"  {r['pass']} {r['name']}: {r['ms']:.3f} ms, {r['speedup']:.2f}x")
+        out += [f"  packed accumulator exact at K={n['k']}: {100 * n['bf16_exact']:.1f}%"
+                for n in d["numerics"]]
+        out += [f"  {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in d["rows"]]
+    out += [f"  {r['pass']} {r['name']}: {r['ms']:.3f} ms, {r['speedup']:.2f}x"
+            for r in train.get("rows", [])]
     for S, v in sorted(parse_splitk(secs.get("rig", "")).items()):
         if len(v) == 3:
-            ratio = v["int32 x2"] / v["packed int16"]
-            out.append(f"split-K S={S}: packed {ratio:.2f}x vs int32 pairs")
+            out.append(f"  split-K S={S}: packed int16 partials "
+                       f"{v['int32 x2'] / v['packed int16']:.2f}x vs int32 pairs")
+    out += [f"  {line.strip()}" for line in secs.get("rig_q", "").splitlines()
+            if line.strip().startswith("reduce at S=")]
+
+    out.append("\nMXFP4 emulated on FP8 tensor cores")
+    for line in secs.get("cuda", "").splitlines():
+        if "rel err" in line or "TFLOP/s" in line or "expansion" in line:
+            out.append(f"  CUDA kernel: {line.strip()}")
+    ops = re.findall(r"^\s+(\d+)\s+([A-Z][\w.]+)$", secs.get("sass", ""), flags=re.M)
+    if ops:
+        out.append("  SASS: " + ", ".join(f"{n} x {op}" for n, op in ops))
+    if m := bench.get("mxfp4"):
+        out.append(f"  Triton: {m['mismatches']} mismatches at K={m['exact_k']}, "
+                   f"max rel err {m['rel_err']:.1e}")
+        out += [f"  {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in m["rows"]]
+
     fair = parse_fair(secs.get("rig_q", ""))
     if "int16, direct" in fair and "fp16, direct" in fair:
-        out.append(f"[13] P=128: int16 direct {fair['int16, direct'][128]}%, "
+        out.append("\nInteger gradient wire (simulated, same on any GPU)")
+        out.append(f"  P=128: int16 direct {fair['int16, direct'][128]}%, "
                    f"fp16 direct {fair['fp16, direct'][128]}%")
     return out
 

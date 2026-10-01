@@ -9,6 +9,7 @@
 !*.cuh
 !*.toml
 !*.lock
+!*.sh
 !Makefile
 !justfile
 
