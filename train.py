@@ -77,6 +77,7 @@ def main():
     p.add_argument("--wire", choices=wire.METHODS, default="fp32")
     p.add_argument("--gemm", choices=("dense", "mxfp4"), default="dense")
     p.add_argument("--out", default="results")
+    p.add_argument("--tokens", type=int, help="token budget across all GPUs (default: preset's)")
     p.add_argument("--batch", type=int, help="override the preset (smoke tests)")
     p.add_argument("--steps", type=int, help="override the token budget (smoke tests)")
     a = p.parse_args()
@@ -84,7 +85,8 @@ def main():
     rank, world, dev = wire.init()
     cfg = PRESETS[a.preset]
     batch, seq = a.batch or cfg["batch"], cfg["seq"]
-    steps = a.steps or max(1, cfg["tokens"][world > 1] // (batch * seq * world))
+    tokens = a.tokens or cfg["tokens"][world > 1]
+    steps = a.steps or max(1, tokens // (batch * seq * world))
     bf16 = dev.type == "cuda" and torch.cuda.get_device_capability(dev)[0] >= 8
     amp = torch.autocast("cuda", torch.bfloat16) if bf16 else contextlib.nullcontext()
 

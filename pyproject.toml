@@ -6,13 +6,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    # Linux PyPI wheels are CUDA-enabled; Windows/macOS get CPU torch, which is
-    # enough for the tests. Pin a CUDA build with
-    #   uv sync --index https://download.pytorch.org/whl/cu128
+    "numpy>=1.26",
+    # Linux PyPI wheels are CUDA-enabled; Windows takes CUDA 13 wheels (sm_75+)
+    # from the PyTorch index below.
     "torch>=2.6",
     # Triton publishes Linux wheels only.
     "triton>=3.0 ; sys_platform == 'linux'",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 
 [dependency-groups]
 dev = ["matplotlib>=3.8", "pytest>=8", "ruff>=0.6"]

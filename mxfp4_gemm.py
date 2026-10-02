@@ -18,24 +18,14 @@ import triton
 import triton.language as tl
 
 
-def _configs():
-    # Every config uses BLOCK_K = SUB*32 <= 128, so K must be a multiple of 128
-    # for the unrolled inner loop to stay in bounds (asserted in the wrappers).
-    cfgs = []
-    for bm, bn, w in [(128, 128, 8), (128, 256, 8), (256, 128, 8),
-                      (128, 64, 4), (64, 128, 4), (64, 64, 4)]:
-        for sub in [2, 4]:                       # BLOCK_K = sub * 32
-            for s in [3, 4]:
-                cfgs.append(triton.Config(
-                    {"BLOCK_M": bm, "BLOCK_N": bn, "SUB": sub, "GROUP_M": 8},
-                    num_warps=w, num_stages=s))
-    return cfgs
+# One fixed config, no autotuning: runs compare methods, not tunings. BLOCK_K =
+# SUB*32 = 64, and the wrappers require K to be a multiple of 128.
+CFG = dict(BLOCK_M=128, BLOCK_N=128, SUB=2, GROUP_M=8, num_warps=8, num_stages=3)
 
 
 # --------------------------------------------------------------------------- #
 #  A [M,K] fp8e4m3 (K-contig), B [K,N] fp8e4m3 (N-contig), values on E2M1 grid
 # --------------------------------------------------------------------------- #
-@triton.autotune(configs=_configs(), key=["M", "N", "K"])
 @triton.jit
 def _mxfp4_gemm_fp8_kernel(
         A, B, C, SA, SB,
@@ -88,12 +78,12 @@ def mxfp4_gemm_fp8(a_fp8, b_fp8, a_scale, b_scale, out_dtype=torch.bfloat16):
     assert K == K2 and K % 128 == 0, "K must be a multiple of 128 (max BLOCK_K)"
     assert a_scale.shape == (M, K // 32) and b_scale.shape == (K // 32, N)
     c = torch.empty((M, N), device=a_fp8.device, dtype=out_dtype)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    grid = (triton.cdiv(M, CFG["BLOCK_M"]) * triton.cdiv(N, CFG["BLOCK_N"]),)
     _mxfp4_gemm_fp8_kernel[grid](
         a_fp8, b_fp8, c, a_scale, b_scale, M, N, K,
         a_fp8.stride(0), a_fp8.stride(1), b_fp8.stride(0), b_fp8.stride(1),
         c.stride(0), c.stride(1),
-        a_scale.stride(0), a_scale.stride(1), b_scale.stride(0), b_scale.stride(1))
+        a_scale.stride(0), a_scale.stride(1), b_scale.stride(0), b_scale.stride(1), **CFG)
     return c
 
 
@@ -123,7 +113,6 @@ def _unpack_to_e4m3(byts, BM: tl.constexpr, HALF: tl.constexpr):
     return out.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
-@triton.autotune(configs=_configs(), key=["M", "N", "K"])
 @triton.jit
 def _mxfp4_gemm_packed_kernel(
         A, B, C, SA, SB,
@@ -176,10 +165,10 @@ def mxfp4_gemm_packed(a_pk, bt_pk, a_scale, b_scale, out_dtype=torch.bfloat16):
     K = Kh * 2
     assert Kh == Kh2 and K % 128 == 0, "K must be a multiple of 128 (max BLOCK_K)"
     c = torch.empty((M, N), device=a_pk.device, dtype=out_dtype)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    grid = (triton.cdiv(M, CFG["BLOCK_M"]) * triton.cdiv(N, CFG["BLOCK_N"]),)
     _mxfp4_gemm_packed_kernel[grid](
         a_pk, bt_pk, c, a_scale, b_scale, M, N, K,
         a_pk.stride(0), a_pk.stride(1), bt_pk.stride(0), bt_pk.stride(1),
         c.stride(0), c.stride(1),
-        a_scale.stride(0), a_scale.stride(1), b_scale.stride(0), b_scale.stride(1))
+        a_scale.stride(0), a_scale.stride(1), b_scale.stride(0), b_scale.stride(1), **CFG)
     return c

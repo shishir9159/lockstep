@@ -32,20 +32,13 @@ def unpack_dual(acc: torch.Tensor, s: int):
     return acc - c2 * w, c2
 
 
-def _cfgs():
-    out = []
-    for bm, bn in [(128, 128), (128, 64), (64, 128), (64, 64)]:
-        for bk in [32, 64]:
-            for w, st in [(4, 3), (8, 3), (8, 4)]:
-                out.append(triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
-                                         num_warps=w, num_stages=st))
-    return out
+# One fixed config, no autotuning: runs compare methods, not tunings.
+CFG = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=8, num_stages=3)
 
 
 # --------------------------------------------------------------------------- #
 #  PACKED: one accumulator carries both problems, one tile stored
 # --------------------------------------------------------------------------- #
-@triton.autotune(configs=_cfgs(), key=["M", "N", "K"])
 @triton.jit
 def _dual_packed_kernel(
         A1, A2S, B1, B2, OUT,
@@ -82,7 +75,6 @@ def _dual_packed_kernel(
 # --------------------------------------------------------------------------- #
 #  SEPARATE: two accumulators in the same fused kernel (the fair baseline)
 # --------------------------------------------------------------------------- #
-@triton.autotune(configs=_cfgs(), key=["M", "N", "K"])
 @triton.jit
 def _dual_separate_kernel(
         A1, A2, B1, B2, OUT1, OUT2,
@@ -193,7 +185,6 @@ def _splitk_separate_kernel(
 #  against cuBLAS would measure Triton-vs-cuBLAS, not the technique; and a bf16
 #  output would round the accumulator away before the slots can be split.
 # --------------------------------------------------------------------------- #
-@triton.autotune(configs=_cfgs(), key=["M", "N", "K"])
 @triton.jit
 def _gemm_kernel(
         A, B, OUT,
@@ -227,11 +218,11 @@ def gemm(a, b):
     N = b.shape[1]
     assert K % 64 == 0, "K must be a multiple of 64 (max BLOCK_K); zero-pad if shorter"
     out = torch.empty((M, N), device=a.device, dtype=torch.float32)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+    grid = (triton.cdiv(M, CFG["BLOCK_M"]), triton.cdiv(N, CFG["BLOCK_N"]))
     _gemm_kernel[grid](
         a, b, out, M, N, K,
         a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-        out.stride(0), out.stride(1))
+        out.stride(0), out.stride(1), **CFG)
     return out
 
 
@@ -242,11 +233,11 @@ def dual_packed(a1, a2s, b1, b2):
     N = b1.shape[1]
     assert K % 64 == 0, "K must be a multiple of 64 (max BLOCK_K); zero-pad if shorter"
     out = torch.empty((M, N), device=a1.device, dtype=torch.float32)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+    grid = (triton.cdiv(M, CFG["BLOCK_M"]), triton.cdiv(N, CFG["BLOCK_N"]))
     _dual_packed_kernel[grid](
         a1, a2s, b1, b2, out, M, N, K,
         a1.stride(0), a1.stride(1), b1.stride(0), b1.stride(1),
-        out.stride(0), out.stride(1))
+        out.stride(0), out.stride(1), **CFG)
     return out
 
 
@@ -256,11 +247,11 @@ def dual_separate(a1, a2, b1, b2):
     assert K % 64 == 0, "K must be a multiple of 64 (max BLOCK_K); zero-pad if shorter"
     c1 = torch.empty((M, N), device=a1.device, dtype=torch.float32)
     c2 = torch.empty_like(c1)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+    grid = (triton.cdiv(M, CFG["BLOCK_M"]), triton.cdiv(N, CFG["BLOCK_N"]))
     _dual_separate_kernel[grid](
         a1, a2, b1, b2, c1, c2, M, N, K,
         a1.stride(0), a1.stride(1), b1.stride(0), b1.stride(1),
-        c1.stride(0), c1.stride(1))
+        c1.stride(0), c1.stride(1), **CFG)
     return c1, c2
 
 

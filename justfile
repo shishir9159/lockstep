@@ -1,216 +1,119 @@
-# Each recipe's comment is the question it answers. Results: FINDINGS.md and
-# rig_sm75/README.md. On Windows set CCBIN to MSVC's Hostx64/x64 first.
-# Rented H100: `just h100-remote user@host` uploads, runs and fetches the report.
+# One recipe per machine, GPU steps only. Each writes results/<recipe>-<time>/:
+# matrix.md (methods x metrics, with time to finish), report.html, CSVs, run.log.
+# The -10m versions check that the hypotheses hold before paying for a full run.
+#
+#   just turing          GTX 1650/1660 SUPER (sm_75)        ~10 min
+#   just h100-10m        one H100, quick check              ~10 min (est.)
+#   just h100            one H100, full                     ~30 min (est.)
+#   just h100-node-10m   every GPU of an H100 node, quick   ~10 min (est.)
+#   just h100-node       every GPU of an H100 node, full    ~30 min on 8 GPUs (est.)
+#
+# Fresh machine: curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install rust-just
+# Windows: export CCBIN="<MSVC>/bin/Hostx64/x64" first.
 
 set windows-shell := ["bash", "-c"]
-
-ccbin := env_var_or_default("CCBIN", "")
-nvcc_flags := "-O3 -std=c++17" + if ccbin != "" { " -ccbin \"" + ccbin + "\"" } else { "" }
-arch := "sm_75"          # override: just arch=sm_90a rig
 
 _default:
     @just --list --unsorted
 
-# Build both portable rigs
-build:
-    nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig rig_sm75/rig.cu
-    nvcc {{nvcc_flags}} -arch={{arch}} -o rig_sm75/rig_q rig_sm75/rig_q.cu
-
-# [1]-[5], or one of: unpack bits reduce gemm splitk
-rig name="": build
-    ./rig_sm75/rig {{name}}
-
-# [6]-[19], or one experiment by name
-rig-q name="": build
-    ./rig_sm75/rig_q {{name}}
-
-# [1] Is FP4 -> FP8 via prmt lossless? (exhaustive)
-unpack: build
-    ./rig_sm75/rig unpack
-
-# [2] How many accumulator bits does a packed dual dot product need?
-bits: build
-    ./rig_sm75/rig bits
-
-# [3] Upper bound: what does halving split-K accumulators buy?
-reduce: build
-    ./rig_sm75/rig reduce
-
-# [4] Is the fwd speedup packing, or loading the shared operand once?
-gemm: build
-    ./rig_sm75/rig gemm
-
-# [5] Do packed int16 partials work as a split-K transport format?
-splitk: build
-    ./rig_sm75/rig splitk
-
-# [6] Is [5]'s win the pairing, or just 16-bit partials?
-narrow: build
-    ./rig_sm75/rig_q narrow
-
-# [7] Is the accumulator or the operand lane the wall for packing?
-int8acc: build
-    ./rig_sm75/rig_q int8acc
-
-# [8] MXFP4 vs NVFP4: accuracy per bit, clean and with outliers
-nvfp4: build
-    ./rig_sm75/rig_q nvfp4
-
-# [9] What does 4-bit buy over MXFP8/BF16 at equal FLOPs?
-mxfp8: build
-    ./rig_sm75/rig_q mxfp8
-
-# [10] Does one nibble-interleaved stream beat two FP4 arrays?
-interleave: build
-    ./rig_sm75/rig_q interleave
-
-# [11] Does off-chip time scale with payload bytes?
-link: build
-    ./rig_sm75/rig_q link
-
-# [12] How dense can partials get if the result is normalized?
-dense: build
-    ./rig_sm75/rig_q dense
-
-# [13] At equal bytes, what are closure, bits and topology each worth?
-fair: build
-    ./rig_sm75/rig_q fair
-
-# [14] Does the integer wire survive 1B-405B parameters?
-llm: build
-    ./rig_sm75/rig_q llm
-
-# [15] Does error feedback make a 1-byte wire usable over many steps?
-ef: build
-    ./rig_sm75/rig_q ef
-
-# [16] Can last step's grid replace the scale collective?
-predict: build
-    ./rig_sm75/rig_q predict
-
-# [17] Two-level NVLink + IB reduction: numerics and time
-tiers: build
-    ./rig_sm75/rig_q tiers
-
-# [18] Which ideas transfer to an MoE all-to-all?
-moe: build
-    ./rig_sm75/rig_q moe
-
-# [19] Does keeping partials integral inside the GEMM buy anything?
-chain: build
-    ./rig_sm75/rig_q chain
-
-# CPU tests (pytest) and the exhaustive FP4 table check; no GPU needed
-test:
-    uv run pytest
-    cc -O2 -I cuda -o cuda/test_unpack cuda/test_unpack.c
-    ./cuda/test_unpack > /dev/null && echo "test_unpack: 0 mismatches"
-
-lint:
-    uv run ruff check .
-
-# ------------------------------------------------ H100 only: each recipe checks GPU 0
-
-# Exit unless GPU 0 is an H100 (sm_90)
-[private]
-h100-guard:
-    #!/usr/bin/env bash
-    gpu=$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader -i 0 2>/dev/null)
-    case "$gpu" in
-        *H100*", 9.0") echo "$gpu" ;;
-        *) echo "needs an H100; found: ${gpu:-no NVIDIA GPU}" >&2; exit 1 ;;
-    esac
-
-# Driver, nvcc, torch and triton versions
-h100-env: h100-guard
-    nvidia-smi --query-gpu=driver_version,memory.total --format=csv,noheader -i 0
-    nvcc --version | tail -1
-    uv run python -c "import torch, triton; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__)"
-
-# CUDA block-scaled GEMM: bit-exactness, then 4096^3 throughput
-h100: h100-guard
-    nvcc {{nvcc_flags}} -arch=sm_90a -o cuda/mxfp4 cuda/mxfp4_mma_gemm.cu
-    ./cuda/mxfp4 --check
-    ./cuda/mxfp4 4096 4096 4096
-
-# Which tensor-core instructions ptxas emitted (HMMA = FP16 path, QGMMA = FP8 wgmma)
-sass:
-    nvcc {{nvcc_flags}} -arch=sm_90a --resource-usage -cubin -o cuda/mxfp4.cubin cuda/mxfp4_mma_gemm.cu
-    cuobjdump -sass cuda/mxfp4.cubin | grep -oE "HMMA[^ ]*|QGMMA[^ ]*|HGMMA[^ ]*|F2FP[^ ]*|LDGSTS[^ ]*" | sort | uniq -c
-
-# Triton: MXFP4 exactness and throughput, then the packed dual GEMM
-bench: h100-guard
-    uv run bench.py
-
-# Triton: one Linear layer fwd + bwd, vanilla vs packed
-train: h100-guard
-    uv run train_step.py
-
-# Triton: did the FP4 kernel get wgmma?
-isa: h100-guard
-    uv run check_isa.py
-
-# The portable rigs, rebuilt for sm_90a
-h100-rig: h100-guard
-    {{just_executable()}} arch=sm_90a rig
-    {{just_executable()}} arch=sm_90a rig-q
-
-# Everything above into results/<time>/: log, JSON, charts, report.html, tarball
-h100-all: h100-guard
+# GTX 1650/1660 SUPER: GPU-timed rig experiments, tiny-GPT method matrix (1M tokens)
+turing: (_guard "turing")
     #!/usr/bin/env bash
     set -uo pipefail
-    out="results/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$out"
-    j="{{just_executable()}}"
-    step() { local name=$1; shift; printf '\n== %s\n' "$name"; "$@" || echo "$name" >> "$out/failed.txt"; }
+    source run.sh
+    begin turing
     {
-        step env   "$j" h100-env
-        step test  "$j" test
-        step cuda  "$j" h100
-        step sass  "$j" sass
-        step isa   uv run check_isa.py
-        step bench uv run bench.py --json "$out/bench.json"
-        step train uv run train_step.py --json "$out/train.json"
-        step build "$j" arch=sm_90a build
-        step rig   ./rig_sm75/rig
-        step rig_q ./rig_sm75/rig_q
+        step env 0 env_info
+        step build 0 build sm_75
+        step rig 1 ./rig_sm75/rig
+        step rig_q 1 rig_q_gpu
+        step data 0 uv run data.py --shards 1
+        train_all tiny 1000000 1 uv run
     } 2>&1 | tee "$out/run.log"
-    echo
-    uv run report.py "$out"
-    tar -czf "$out.tar.gz" -C results "$(basename "$out")"
-    cp "$out.tar.gz" results/latest.tar.gz
-    host="$(whoami)@$(hostname -f 2>/dev/null || hostname)"
-    echo "fetch: scp $host:$PWD/results/latest.tar.gz ."
-    echo "view:  just h100-serve   (then on your machine: ssh -N -L 8000:localhost:8000 $host)"
+    finish
 
-# From your machine: upload to a rented H100, run there detached, fetch the report
-h100-remote host dir="lockstep":
+# One H100, quick: kernels, packing check, GPT-2 method matrix at 3M tokens
+h100-10m: (_guard "h100")
     #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p results
-    git ls-files -z --cached --others --exclude-standard | xargs -0 tar -czf results/src.tar.gz
-    scp results/src.tar.gz {{host}}:{{dir}}.tar.gz
-    ssh {{host}} 'mkdir -p {{dir}} && tar -xzf {{dir}}.tar.gz -C {{dir}} && cd {{dir}} && { nohup bash h100.sh > h100.out 2>&1 < /dev/null & echo $! > h100.pid; }'
-    "{{just_executable()}}" h100-fetch {{host}} {{dir}}
+    set -uo pipefail
+    source run.sh
+    export CUDA_VISIBLE_DEVICES=0                      # on a multi-GPU box the others idle
+    begin h100-10m
+    {
+        step env 0 env_info
+        h100_kernels quick
+        step data 0 uv run data.py --shards 1
+        train_all gpt2 3000000 1 uv run
+    } 2>&1 | tee "$out/run.log"
+    finish
 
-# Follow a remote run to the end (re-run after a dropped connection), then fetch
-h100-fetch host dir="lockstep":
+# One H100, full: kernels, every GPU rig experiment, GPT-2 method matrix at 20M tokens
+h100: (_guard "h100")
     #!/usr/bin/env bash
-    set -euo pipefail
-    ssh {{host}} 'cd {{dir}} && tail -n +1 -f --pid="$(cat h100.pid)" h100.out'
-    mkdir -p results
-    scp {{host}}:{{dir}}/results/latest.tar.gz results/h100.tar.gz
-    run=$(tar -tzf results/h100.tar.gz | sed -n '1s|/.*||p')
-    tar -xzf results/h100.tar.gz -C results
-    echo "report: results/$run/report.html (stop the instance now)"
+    set -uo pipefail
+    source run.sh
+    export CUDA_VISIBLE_DEVICES=0                      # on a multi-GPU box the others idle
+    begin h100
+    {
+        step env 0 env_info
+        h100_kernels full
+        step data 0 uv run data.py --shards 1
+        train_all gpt2 20000000 1 uv run
+    } 2>&1 | tee "$out/run.log"
+    finish
 
-# Serve results/ on localhost; open it from your machine through an ssh tunnel
-h100-serve port="8000":
-    @echo "on your machine: ssh -N -L {{port}}:localhost:{{port}} $(whoami)@$(hostname -f 2>/dev/null || hostname)"
-    @echo "then open http://localhost:{{port}} and click into the run folder"
-    uv run python -m http.server {{port}} --bind 127.0.0.1 --directory results
+# H100 node, quick: wire microbench, GPT-2 methods at 20M tokens on all GPUs, kernels
+h100-node-10m: (_guard "node")
+    #!/usr/bin/env bash
+    set -uo pipefail
+    source run.sh
+    begin h100-node-10m
+    tr=(uv run torchrun --standalone --nproc-per-node=gpu)   # ranks from torchrun's env
+    {
+        step env 0 env_info
+        step data 0 uv run data.py --shards 1                # all GPUs idle
+        step wire "$GPUS" "${tr[@]}" wire.py --out "$out"     # all GPUs busy
+        train_all gpt2 20000000 "$GPUS" "${tr[@]}"           # all GPUs busy
+        (export CUDA_VISIBLE_DEVICES=0; h100_kernels quick)  # 1 GPU busy, the rest idle
+    } 2>&1 | tee "$out/run.log"
+    finish
 
-clean:
-    rm -f rig_sm75/rig rig_sm75/rig_q rig_sm75/*.exe rig_sm75/*.exp rig_sm75/*.lib rig_sm75/*.obj
-    rm -f cuda/mxfp4 cuda/mxfp4.exe cuda/mxfp4.cubin cuda/*.obj cuda/test_unpack cuda/test_unpack.exe
-    rm -rf __pycache__ tests/__pycache__ .ruff_cache .pytest_cache
+# For several nodes, launch train.py and wire.py with torchrun or srun yourself: they
+# read RANK/WORLD_SIZE/LOCAL_RANK or SLURM_* from the environment.
+# H100 node, full: wire microbench, GPT-2 methods at 200M tokens on all GPUs, kernels
+h100-node: (_guard "node")
+    #!/usr/bin/env bash
+    set -uo pipefail
+    source run.sh
+    begin h100-node
+    tr=(uv run torchrun --standalone --nproc-per-node=gpu)   # ranks from torchrun's env
+    {
+        step env 0 env_info
+        step data 0 uv run data.py --shards 2                # all GPUs idle
+        step wire "$GPUS" "${tr[@]}" wire.py --out "$out"     # all GPUs busy
+        train_all gpt2 200000000 "$GPUS" "${tr[@]}"          # all GPUs busy
+        (export CUDA_VISIBLE_DEVICES=0; h100_kernels full)   # 1 GPU busy, the rest idle
+    } 2>&1 | tee "$out/run.log"
+    finish
+
+# Fails unless the GPUs match the recipe
+_guard kind:
+    #!/usr/bin/env bash
+    gpus=$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null)
+    n=$(printf '%s\n' "$gpus" | grep -c .)
+    h100=$(printf '%s\n' "$gpus" | grep -c 'H100.*, 9\.0$')
+    first=$(printf '%s\n' "$gpus" | sed -n 1p)
+    case "{{kind}}" in
+        turing) [[ "$first" == *", 7.5" ]] ;;
+        h100)   [[ "$first" == *H100*", 9.0" ]] ;;
+        node)   [ "$n" -ge 2 ] && [ "$h100" -eq "$n" ] ;;
+    esac || { echo "'{{kind}}' does not match this machine: ${gpus:-no NVIDIA GPU}" >&2; exit 1; }
+
+# One rig experiment by name, e.g. `just rig-q fair` (any sm_75+ GPU)
+[private]
+rig-q name="" arch="sm_75":
+    bash -c 'source run.sh && build {{arch}}' && ./rig_sm75/rig_q {{name}}
+
+[private]
+rig name="" arch="sm_75":
+    bash -c 'source run.sh && build {{arch}}' && ./rig_sm75/rig {{name}}
