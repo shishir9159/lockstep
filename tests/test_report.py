@@ -22,8 +22,19 @@ RIGQ = """
 
 
 def test_sections_split_on_step_markers():
-    s = report.sections("\n== env\nNVIDIA H100 80GB HBM3, 9.0\n\n== rig\nx\n")
+    s = report.sections("\n== env  [0 of 8 GPUs busy, 8 idle]\nNVIDIA H100 80GB HBM3, 9.0\n"
+                        "\n== rig  [1 of 8 GPUs busy, 7 idle]\nx\n")
     assert s["env"].strip() == "NVIDIA H100 80GB HBM3, 9.0" and s["rig"].strip() == "x"
+
+
+def test_training_matrix_puts_the_baseline_first():
+    row = dict(preset="tiny", gpus="1", tokens="1000000", compute="fp32", tok_per_s="1",
+               comm_ms_per_step="0", wire_B_per_el="4", peak_GB="1", gemm_path="dense")
+    train = [dict(row, method="int16 / dense", val_loss="5.10", seconds="60"),
+             dict(row, method="fp32 / dense", val_loss="5.00", seconds="50")]
+    md = report.matrix(dict(steps=[], train=train, wire=[], bench={}, train_step={}, secs={}))[0]
+    lines = [ln for ln in md.splitlines() if ln.startswith("| ") and "/ dense" in ln]
+    assert lines[0].startswith("| fp32 / dense") and "+0.1000" in lines[1] and "1.20" in lines[1]
 
 
 def test_rig_tables_parse():

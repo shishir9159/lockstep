@@ -1,11 +1,13 @@
-"""Turn one H100 run into charts, a single-file HTML report and a terminal summary.
+"""Method matrix for one run: tables in matrix.md (also printed), charts, report.html.
 
-    uv run report.py results/<run>      # reads run.log, bench.json, train.json
+    uv run report.py results/<run>
 
-Writes <run>/plots/*.png and <run>/report.html. Anything missing is skipped.
+Reads what the run produced: steps.csv, train.csv, wire.csv, bench.json,
+train_step.json, curves/ and run.log (rig output). Missing pieces are skipped.
 """
 
 import base64
+import csv
 import html
 import json
 import re
@@ -14,12 +16,14 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")                          # headless: no display over ssh
+matplotlib.use("Agg")                          # headless
 import matplotlib.pyplot as plt  # noqa: E402
 
 SURFACE, INK, INK2, MUTED = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
 GRID, AXIS = "#e1e0d9", "#c3c2b7"
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]      # validated categorical order
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",       # validated categorical order
+          "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+BASE = "fp32 / dense"
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -33,10 +37,10 @@ plt.rcParams.update({
 })
 
 
-# ------------------------------------------------------------------- parsing
+# ------------------------------------------------------------------- inputs
 def sections(log):
-    """Split run.log on the '== name' markers that `just h100-all` prints."""
-    parts = re.split(r"^== (\S+)$", log, flags=re.M)
+    """Split run.log on the '== name  [...]' step markers printed by run.sh."""
+    parts = re.split(r"^== (\S+).*$", log, flags=re.M)
     return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
 
 
@@ -87,6 +91,100 @@ def parse_predict(rigq):
     return out
 
 
+def read_csv(path):
+    return list(csv.DictReader(open(path))) if path.exists() else []
+
+
+# ------------------------------------------------------------------- tables
+def table(title, head, rows, note=""):
+    """A markdown table padded to line up in a terminal."""
+    rows = [[str(c) for c in r] for r in rows]
+    w = [max(len(str(h)), *(len(r[i]) for r in rows)) for i, h in enumerate(head)]
+    line = lambda cells: "| " + " | ".join(c.ljust(w[i]) for i, c in enumerate(cells)) + " |"
+    out = [f"## {title}", "", line(head), "|" + "|".join("-" * (x + 2) for x in w) + "|"]
+    out += [line(r) for r in rows]
+    return "\n".join(out + ([f"\n{note}"] if note else [])) + "\n"
+
+
+def matrix(d):
+    t = []
+    if steps := d["steps"]:
+        total = sum(float(s["seconds"]) for s in steps)
+        t.append(table("Steps", ["step", "GPUs busy", "GPUs idle", "seconds", "status"],
+                       [[s["step"], s["gpus_busy"], s["gpus_idle"], s["seconds"], s["status"]]
+                        for s in steps], f"Total: {total / 60:.1f} min."))
+    if tr := d["train"]:
+        tr = sorted(tr, key=lambda r: r["method"] != BASE)
+        b = tr[0]
+        r0 = tr[0]
+        t.append(table(
+            f"Training: GPT-2 '{r0['preset']}' on FineWeb, {r0['gpus']} GPU(s), "
+            f"{int(r0['tokens']) / 1e6:.1f}M tokens, {r0['compute']} compute",
+            ["wire / gemm", "val loss", "Δ vs base", "time s", "× base time", "tok/s",
+             "comm ms/step", "wire B/el", "peak GB", "gemm path"],
+            [[r["method"], r["val_loss"], f"{float(r['val_loss']) - float(b['val_loss']):+.4f}",
+              r["seconds"], f"{float(r['seconds']) / float(b['seconds']):.2f}", r["tok_per_s"],
+              r["comm_ms_per_step"], r["wire_B_per_el"], r["peak_GB"], r["gemm_path"]]
+             for r in tr],
+            f"Baseline: {b['method']}. Same model, data order, seed and schedule in every row."))
+    if wr := d["wire"]:
+        b = wr[0]
+        t.append(table(f"Gradient wire microbench: GPT-2-sized gradient, {b['gpus']} GPUs",
+                       ["wire", "B/el", "ms", "× fp32 time", "grad GB/s", "rel err",
+                        "order-independent", "time s"],
+                       [[r["method"], r["B_per_el"], r["ms"],
+                         f"{float(r['ms']) / float(b['ms']):.2f}", r["grad_GBps"], r["rel_err"],
+                         r["order_independent"], r["seconds"]] for r in wr]))
+    secs = d["secs"]
+    if m := d["bench"].get("mxfp4"):
+        rows = [[r["name"], f"{r['ms']:.3f}", f"{r['tflops']:.0f}",
+                 f"{r['tflops'] / m['rows'][0]['tflops']:.2f}"] for r in m["rows"]]
+        cuda = re.search(r"(\d+)x(\d+)x(\d+)\s+([\d.]+) ms\s+([\d.]+) TFLOP/s",
+                         secs.get("cuda-kernel", ""))
+        if cuda:
+            rows.append(["CUDA mma.sync reference", cuda.group(4), f"{float(cuda.group(5)):.0f}",
+                         f"{float(cuda.group(5)) / m['rows'][0]['tflops']:.2f}"])
+        ops = re.findall(r"^\s+(\d+)\s+([A-Z][\w.]+)$", secs.get("sass", ""), flags=re.M)
+        sass = ", ".join(f"{n} {o}" for n, o in ops) or "-"
+        t.append(table("MXFP4 GEMM on FP8 tensor cores, 4096^3",
+                       ["kernel", "ms", "TFLOP/s", "× bf16"], rows,
+                       f"Exactness: {m['mismatches']} mismatches at K={m['exact_k']}, max rel err "
+                       f"{m['rel_err']:.1e}. SASS: {sass}."))
+    if du := d["bench"].get("dual"):
+        b = du["rows"][0]
+        t.append(table("Packing: two GEMMs, separate vs one packed accumulator",
+                       ["variant", "ms", "TFLOP/s", "× first"],
+                       [[r["name"], f"{r['ms']:.3f}", f"{r['tflops']:.0f}",
+                         f"{b['ms'] / r['ms']:.2f}"] for r in du["rows"]]))
+        t.append(table("Packing: does one accumulator hold both results exactly?",
+                       ["K", "slot s", "bits needed", "bf16 exact", "fp8 exact"],
+                       [[n["k"], n["s"], n["bits"], f"{100 * n['bf16_exact']:.1f}%",
+                         "-" if n["fp8_exact"] is None else f"{100 * n['fp8_exact']:.1f}%"]
+                        for n in du["numerics"]]))
+    if ts := d["train_step"].get("rows"):
+        t.append(table("Packing: one Linear layer, fwd / dgrad / wgrad",
+                       ["pass", "variant", "ms", "TFLOP/s", "speedup"],
+                       [[r["pass"], r["name"], f"{r['ms']:.3f}", f"{r['tflops']:.0f}",
+                         f"{r['speedup']:.2f}"] for r in ts],
+                       "Speedup is against each pass's first row."))
+    if sk := {S: v for S, v in parse_splitk(secs.get("rig", "")).items() if len(v) == 3}:
+        pair = next((ln.strip() for ln in secs.get("rig_q", "").splitlines()
+                     if ln.strip().startswith("reduce at S=")), "")
+        t.append(table("Packing: split-K partials as int32 pairs, packed int16, or atomics",
+                       ["S", "int32 x2 ms", "packed ms", "atomics ms", "packed × int32"],
+                       [[S, v["int32 x2"], v["packed int16"], v["atomics"],
+                         f"{v['int32 x2'] / v['packed int16']:.2f}"]
+                        for S, v in sorted(sk.items())], pair))
+    if fair := parse_fair(secs.get("rig_q", "")):
+        ps = sorted({p for v in fair.values() for p in v})
+        t.append(table("Simulated wire [13]: relative error by GPU count", ["wire", *map(str, ps)],
+                       [[k, *(f"{v[p]}%" for p in ps)] for k, v in fair.items()]))
+    if ef := parse_ef(secs.get("rig_q", "")):
+        t.append(table("Simulated error feedback [15]: drift after 8 / 32 / 128 steps",
+                       ["wire", "8", "32", "128"], [[k, *v] for k, v in ef.items()]))
+    return t
+
+
 # ------------------------------------------------------------------- charts
 def hbar(ax, labels, values, fmt, ref=()):
     """Single-series horizontal bars from a zero baseline, value at each tip."""
@@ -101,27 +199,8 @@ def hbar(ax, labels, values, fmt, ref=()):
         ax.text(r, -0.85, f" {name}", fontsize=8, color=MUTED, va="center")
     ax.set_yticks(list(y), labels)
     ax.set_ylim(-1.1 if ref else -0.6, len(labels) - 0.4)
-    ax.set_xlim(0, top * 1.15)
+    ax.set_xlim(0, top * 1.18)
     ax.grid(axis="y", visible=False)
-
-
-def lines(ax, xs, series, logy=True, logx=False):
-    """Up to four labelled lines: legend plus a direct label at each line's end."""
-    for i, (name, ys) in enumerate(series.items()):
-        c = SERIES[i]
-        ax.plot(xs, ys, color=c, marker="o", markersize=6, markeredgecolor=SURFACE,
-                markeredgewidth=1.5, label=name)
-        ax.annotate(name, (xs[-1], ys[-1]), xytext=(8, 0), textcoords="offset points",
-                    va="center", fontsize=8.5, color=INK2)
-    if logy:
-        ax.set_yscale("log")
-    if logx:
-        ax.set_xscale("log", base=2)
-    ax.set_xticks(xs, [str(x) for x in xs])
-    ax.minorticks_off()
-    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=len(series))
-    ax.margins(x=0.05)
-    ax.set_xlim(right=xs[-1] * (1.9 if logx else 1.35))
 
 
 def save(fig, path):
@@ -131,165 +210,108 @@ def save(fig, path):
     return path
 
 
-def charts(run, bench, train, secs):
-    plots = run / "plots"
-    plots.mkdir(exist_ok=True)
-    made = []
-    rig, rigq = secs.get("rig", ""), secs.get("rig_q", "")
-    if bench.get("mxfp4"):
-        rows = bench["mxfp4"]["rows"]
-        fig, ax = plt.subplots(figsize=(8, 0.5 * len(rows) + 1.4))
-        hbar(ax, [r["name"] for r in rows], [r["tflops"] for r in rows], lambda v: f"{v:.0f}",
-             ref=[(989, "bf16 peak"), (1979, "fp8 peak")])
-        ax.set_title("MXFP4 on H100 FP8 tensor cores")
-        ax.set_xlabel("TFLOP/s, 4096^3")
-        made.append(("MXFP4 GEMM throughput", save(fig, plots / "mxfp4_tflops.png")))
-    if bench.get("dual"):
-        rows = bench["dual"]["rows"]
-        fig, ax = plt.subplots(figsize=(8, 0.5 * len(rows) + 1.4))
-        hbar(ax, [r["name"] for r in rows], [r["tflops"] for r in rows], lambda v: f"{v:.0f}")
-        ax.set_title("Two GEMMs: separate vs one packed accumulator")
-        ax.set_xlabel("TFLOP/s (both GEMMs)")
-        made.append(("Packed dual GEMM throughput", save(fig, plots / "dual_tflops.png")))
-    if train.get("rows"):
-        passes = list(dict.fromkeys(r["pass"] for r in train["rows"]))
-        ratios = [sum(r["pass"] == p for r in train["rows"]) for p in passes]
-        fig, axes = plt.subplots(len(passes), 1, figsize=(8, 1.2 + 0.45 * len(train["rows"])),
-                                 gridspec_kw={"height_ratios": ratios})
-        for ax, p in zip(axes, passes, strict=True):
-            rows = [r for r in train["rows"] if r["pass"] == p]
-            hbar(ax, [r["name"] for r in rows], [r["speedup"] for r in rows], lambda v: f"{v:.2f}x",
-                 ref=[(1.0, "baseline")])
-            ax.set_title(p, fontsize=10)
-        axes[-1].set_xlabel("speedup over the first row of each pass")
-        made.append(("One Linear layer, fwd / dgrad / wgrad",
-                     save(fig, plots / "train_speedup.png")))
-    if (sk := parse_splitk(rig)) and all(len(v) == 3 for v in sk.values()):
-        S = sorted(sk)
-        names = ["int32 x2", "packed int16", "atomics"]
-        fig, ax = plt.subplots(figsize=(8, 3.6))
-        w = 0.26
-        for i, n in enumerate(names):
-            xs = [j + (i - 1) * (w + 0.02) for j in range(len(S))]
-            ax.bar(xs, [sk[s][n] for s in S], width=w, color=SERIES[i], label=n)
-        ax.set_xticks(range(len(S)), [f"S={s}" for s in S])
-        ax.set_ylabel("total ms (GEMM + reduce)")
-        ax.set_title("[5] split-K on this GPU: partials as int32 pairs, packed int16, or atomics")
-        ax.grid(axis="x", visible=False)
-        ax.legend(loc="upper left")
-        made.append(("Split-K transport", save(fig, plots / "splitk.png")))
-    if fair := parse_fair(rigq):
-        keep = ["bf16, ring", "fp16, ring", "int16, ring, oracle grid", "int16, direct"]
-        if all(k in fair for k in keep):
-            P = sorted(fair[keep[0]])
-            fig, ax = plt.subplots(figsize=(8, 4))
-            lines(ax, P, {k: [fair[k][p] for p in P] for k in keep}, logx=True)
-            ax.set_xlabel("GPUs (P)")
-            ax.set_ylabel("relative error of the reduced gradient, %")
-            ax.set_title("[13] All-reduce at 2 bytes per element: ring vs direct")
-            made.append(("Ring vs direct reduce-scatter", save(fig, plots / "ring_vs_direct.png")))
-    if ef := parse_ef(rigq):
-        keep = ["bf16 ring", "int8 ring, nearest", "int8 ring, EF", "int8 direct, EF"]
-        if all(k in ef for k in keep):
-            fig, ax = plt.subplots(figsize=(8, 4))
-            lines(ax, [8, 32, 128], {k: ef[k] for k in keep}, logx=True)
-            ax.set_xlabel("training steps")
-            ax.set_ylabel("drift (steps of gradient lost)")
-            ax.set_title("[15] Error feedback: accumulated error over steps")
-            made.append(("Error feedback", save(fig, plots / "drift.png")))
-    if pr := parse_predict(rigq):
-        names = list(pr)[::-1]
-        fig, ax = plt.subplots(figsize=(8, 0.4 * len(names) + 1.4))
-        ax.scatter([pr[n] for n in names], range(len(names)), s=48, color=SERIES[0],
-                   edgecolors=SURFACE, linewidths=1.5, zorder=3)
-        for i, n in enumerate(names):
-            ax.annotate(f"{pr[n]:.4f}%", (pr[n], i), xytext=(7, 0), textcoords="offset points",
-                        va="center", fontsize=8.5, color=INK2)
-        ax.set_yticks(range(len(names)), names)
-        ax.set_xscale("log")
-        ax.set_xlim(right=max(pr.values()) * 8)
-        ax.set_xlabel("accumulated error after 128 steps, % (log)")
-        ax.set_title("[16] Predicted vs exact grids")
-        made.append(("Grid prediction", save(fig, plots / "predict.png")))
-    return made
-
-
-# ------------------------------------------------------------------- summary
-def summary(bench, train, secs):
-    out = []
-    env = secs.get("env", "").strip().splitlines()
-    if env:
-        out.append(f"GPU: {env[0].strip()}")
-
-    out.append("\nTwo batches in one element (the packing idea)")
-    if d := bench.get("dual"):
-        out += [f"  packed accumulator exact at K={n['k']}: {100 * n['bf16_exact']:.1f}%"
-                for n in d["numerics"]]
-        out += [f"  {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in d["rows"]]
-    out += [f"  {r['pass']} {r['name']}: {r['ms']:.3f} ms, {r['speedup']:.2f}x"
-            for r in train.get("rows", [])]
-    for S, v in sorted(parse_splitk(secs.get("rig", "")).items()):
-        if len(v) == 3:
-            out.append(f"  split-K S={S}: packed int16 partials "
-                       f"{v['int32 x2'] / v['packed int16']:.2f}x vs int32 pairs")
-    out += [f"  {line.strip()}" for line in secs.get("rig_q", "").splitlines()
-            if line.strip().startswith("reduce at S=")]
-
-    out.append("\nMXFP4 emulated on FP8 tensor cores")
-    for line in secs.get("cuda", "").splitlines():
-        if "rel err" in line or "TFLOP/s" in line or "expansion" in line:
-            out.append(f"  CUDA kernel: {line.strip()}")
-    ops = re.findall(r"^\s+(\d+)\s+([A-Z][\w.]+)$", secs.get("sass", ""), flags=re.M)
-    if ops:
-        out.append("  SASS: " + ", ".join(f"{n} x {op}" for n, op in ops))
-    if m := bench.get("mxfp4"):
-        out.append(f"  Triton: {m['mismatches']} mismatches at K={m['exact_k']}, "
-                   f"max rel err {m['rel_err']:.1e}")
-        out += [f"  {r['name']}: {r['tflops']:.0f} TFLOP/s" for r in m["rows"]]
-
-    fair = parse_fair(secs.get("rig_q", ""))
-    if "int16, direct" in fair and "fp16, direct" in fair:
-        out.append("\nInteger gradient wire (simulated, same on any GPU)")
-        out.append(f"  P=128: int16 direct {fair['int16, direct'][128]}%, "
-                   f"fp16 direct {fair['fp16, direct'][128]}%")
+def ema(xs, a=0.9):
+    out, m = [], xs[0]
+    for x in xs:
+        m = a * m + (1 - a) * x
+        out.append(m)
     return out
 
 
+def charts(run, d):
+    plots = run / "plots"
+    plots.mkdir(exist_ok=True)
+    made, secs = [], d["secs"]
+    curves = {p.stem: read_csv(p) for p in sorted((run / "curves").glob("*.csv"))}
+    if "fp32-dense" in curves and len(curves) > 1:
+        base = ema([float(r["loss"]) for r in curves["fp32-dense"]])
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for i, (name, rows) in enumerate(c for c in curves.items() if c[0] != "fp32-dense"):
+            loss = ema([float(r["loss"]) for r in rows])
+            ax.plot([int(r["tokens"]) / 1e6 for r in rows],
+                    [a - b for a, b in zip(loss, base, strict=False)],
+                    color=SERIES[i % len(SERIES)], label=name.replace("-", " / "))
+        ax.axhline(0, color=MUTED, linewidth=1)
+        ax.set_xlabel("tokens (M)")
+        ax.set_ylabel("train loss minus fp32 / dense (smoothed)")
+        ax.set_title("Training: loss difference from the baseline, same batches")
+        ax.legend(loc="upper left", bbox_to_anchor=(0, -0.16), ncol=3)
+        made.append(("Loss vs baseline", save(fig, plots / "loss_delta.png")))
+    if tr := d["train"]:
+        tr = sorted(tr, key=lambda r: r["method"] != BASE)
+        fig, ax = plt.subplots(figsize=(8, 0.5 * len(tr) + 1.4))
+        hbar(ax, [f"{r['method']}  (val {float(r['val_loss']):.3f})" for r in tr],
+             [float(r["seconds"]) for r in tr], lambda v: f"{v:.0f} s")
+        ax.set_title("Training: time to finish the same token budget")
+        ax.set_xlabel("seconds")
+        made.append(("Time to finish", save(fig, plots / "train_time.png")))
+    if wr := d["wire"]:
+        fig, ax = plt.subplots(figsize=(8, 0.5 * len(wr) + 1.4))
+        hbar(ax, [f"{r['method']}  (err {r['rel_err']})" for r in wr], [float(r["ms"]) for r in wr],
+             lambda v: f"{v:.1f} ms")
+        ax.set_title("Gradient wire: one all-reduce of a GPT-2-sized gradient")
+        ax.set_xlabel("ms")
+        made.append(("Wire microbench", save(fig, plots / "wire.png")))
+    if m := d["bench"].get("mxfp4"):
+        fig, ax = plt.subplots(figsize=(8, 0.5 * len(m["rows"]) + 1.4))
+        hbar(ax, [r["name"] for r in m["rows"]], [r["tflops"] for r in m["rows"]],
+             lambda v: f"{v:.0f}", ref=[(989, "bf16 peak"), (1979, "fp8 peak")])
+        ax.set_title("MXFP4 on H100 FP8 tensor cores")
+        ax.set_xlabel("TFLOP/s, 4096^3")
+        made.append(("MXFP4 GEMM", save(fig, plots / "mxfp4.png")))
+    if du := d["bench"].get("dual"):
+        fig, ax = plt.subplots(figsize=(8, 0.5 * len(du["rows"]) + 1.4))
+        hbar(ax, [r["name"] for r in du["rows"]], [r["tflops"] for r in du["rows"]],
+             lambda v: f"{v:.0f}")
+        ax.set_title("Packing: two GEMMs, separate vs one packed accumulator")
+        ax.set_xlabel("TFLOP/s (both GEMMs)")
+        made.append(("Packed accumulator", save(fig, plots / "dual.png")))
+    if (sk := parse_splitk(secs.get("rig", ""))) and all(len(v) == 3 for v in sk.values()):
+        S, names = sorted(sk), ["int32 x2", "packed int16", "atomics"]
+        fig, ax = plt.subplots(figsize=(8, 3.6))
+        for i, n in enumerate(names):
+            ax.bar([j + (i - 1) * 0.28 for j in range(len(S))], [sk[s][n] for s in S],
+                   width=0.26, color=SERIES[i], label=n)
+        ax.set_xticks(range(len(S)), [f"S={s}" for s in S])
+        ax.set_ylabel("total ms (GEMM + reduce)")
+        ax.set_title("Packing: split-K partials on this GPU")
+        ax.grid(axis="x", visible=False)
+        ax.legend(loc="upper left")
+        made.append(("Split-K transport", save(fig, plots / "splitk.png")))
+    return made
+
+
+# ------------------------------------------------------------------- main
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")    # Windows consoles: Δ, ×
     run = Path(sys.argv[1] if len(sys.argv) > 1 else "results")
     load = lambda n: json.loads((run / n).read_text()) if (run / n).exists() else {}
-    bench, train = load("bench.json"), load("train.json")
     log = (run / "run.log").read_text(errors="replace") if (run / "run.log").exists() else ""
-    secs = sections(log)
-    made = charts(run, bench, train, secs)
-    lines_ = summary(bench, train, secs)
-    failed = (run / "failed.txt").read_text().split() if (run / "failed.txt").exists() else []
-
+    d = {"steps": read_csv(run / "steps.csv"), "train": read_csv(run / "train.csv"),
+         "wire": read_csv(run / "wire.csv"), "bench": load("bench.json"),
+         "train_step": load("train_step.json"), "secs": sections(log)}
+    md = f"# {run.name}\n\n" + "\n".join(matrix(d))
+    (run / "matrix.md").write_text(md, encoding="utf-8")
+    made = charts(run, d)
     figs = "".join(
         f"<figure><img alt='{html.escape(t)}' src='data:image/png;base64,"
-        f"{base64.b64encode(p.read_bytes()).decode()}'><figcaption>{html.escape(t)}</figcaption></figure>"
-        for t, p in made)
-    body = "\n".join(html.escape(x) for x in lines_)
-    fail = f"<p class=bad>Failed steps: {html.escape(' '.join(failed))}</p>" if failed else ""
-    tables = "".join(f"<details><summary>{html.escape(k)}</summary>"
-                     f"<pre>{html.escape(v.strip())}</pre></details>" for k, v in secs.items())
+        f"{base64.b64encode(p.read_bytes()).decode()}'><figcaption>{html.escape(t)}</figcaption>"
+        f"</figure>" for t, p in made)
+    raw = "".join(f"<details><summary>{html.escape(k)}</summary>"
+                  f"<pre>{html.escape(v.strip())}</pre></details>" for k, v in d["secs"].items())
     (run / "report.html").write_text(f"""<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>H100 run {run.name}</title>
-<style>
-body{{margin:0 auto;max-width:960px;padding:24px 16px;background:#f9f9f7;color:{INK};
-font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}}h1{{font-size:20px;margin:0 0 12px}}
-pre{{background:{SURFACE};padding:12px;overflow-x:auto;border:1px solid {GRID};border-radius:6px;
-font-size:12px}}figure{{margin:16px 0}}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>{run.name}</title><style>
+body{{margin:0 auto;max-width:1000px;padding:24px 16px;background:#f9f9f7;color:{INK};
+font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}}
+pre{{background:{SURFACE};padding:12px;overflow-x:auto;border:1px solid {GRID};
+border-radius:6px;font-size:12px}}figure{{margin:16px 0}}
 img{{max-width:100%;border:1px solid {GRID};border-radius:6px}}
-figcaption{{color:{INK2};font-size:12px}}
-.bad{{color:#d03b3b;font-weight:600}}summary{{cursor:pointer;color:{INK2};padding:4px 0}}
-</style></head><body><h1>H100 run {html.escape(run.name)}</h1>{fail}<pre>{body}</pre>{figs}
-<h2 style="font-size:15px">Raw output</h2>{tables}</body></html>""", encoding="utf-8")
-
-    print("\n".join(lines_))
-    if failed:
-        print("failed steps:", " ".join(failed))
-    print(f"charts: {len(made)} in {run / 'plots'}\nreport: {run / 'report.html'}")
+figcaption{{color:{INK2};font-size:12px}}summary{{cursor:pointer;color:{INK2};padding:4px 0}}
+</style></head><body><pre>{html.escape(md)}</pre>{figs}<h2>Raw output</h2>{raw}</body></html>""",
+                                      encoding="utf-8")
+    print(md)
+    print(f"charts: {len(made)} in {run / 'plots'}\nmatrix: {run / 'matrix.md'}\n"
+          f"report: {run / 'report.html'}")
 
 
 if __name__ == "__main__":
