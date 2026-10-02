@@ -9,6 +9,8 @@
 #   just h100-node       every GPU of an H100 node, full    ~30 min on 8 GPUs (est.)
 #
 # Fresh machine: curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install rust-just
+# Data: each recipe first runs `just data`, which keeps the tokens in ./data
+# (or $LOCKSTEP_DATA).
 # Windows: export CCBIN="<MSVC>/bin/Hostx64/x64" first.
 
 set windows-shell := ["bash", "-c"]
@@ -17,7 +19,7 @@ _default:
     @just --list --unsorted
 
 # GTX 1650/1660 SUPER: GPU-timed rig experiments, tiny-GPT method matrix (1M tokens)
-turing: (_guard "turing")
+turing: (_guard "turing") (data "1")
     #!/usr/bin/env bash
     set -uo pipefail
     source run.sh
@@ -27,13 +29,12 @@ turing: (_guard "turing")
         step build 0 build sm_75
         step rig 1 ./rig_sm75/rig
         step rig_q 1 rig_q_gpu
-        step data 0 uv run data.py --shards 1
         train_all tiny 1000000 1 uv run
     } 2>&1 | tee "$out/run.log"
     finish
 
 # One H100, quick: kernels, packing check, GPT-2 method matrix at 3M tokens
-h100-10m: (_guard "h100")
+h100-10m: (_guard "h100") (data "1")
     #!/usr/bin/env bash
     set -uo pipefail
     source run.sh
@@ -42,13 +43,12 @@ h100-10m: (_guard "h100")
     {
         step env 0 env_info
         h100_kernels quick
-        step data 0 uv run data.py --shards 1
         train_all gpt2 3000000 1 uv run
     } 2>&1 | tee "$out/run.log"
     finish
 
 # One H100, full: kernels, every GPU rig experiment, GPT-2 method matrix at 20M tokens
-h100: (_guard "h100")
+h100: (_guard "h100") (data "1")
     #!/usr/bin/env bash
     set -uo pipefail
     source run.sh
@@ -57,13 +57,12 @@ h100: (_guard "h100")
     {
         step env 0 env_info
         h100_kernels full
-        step data 0 uv run data.py --shards 1
         train_all gpt2 20000000 1 uv run
     } 2>&1 | tee "$out/run.log"
     finish
 
 # H100 node, quick: wire microbench, GPT-2 methods at 20M tokens on all GPUs, kernels
-h100-node-10m: (_guard "node")
+h100-node-10m: (_guard "node") (data "1")
     #!/usr/bin/env bash
     set -uo pipefail
     source run.sh
@@ -71,7 +70,6 @@ h100-node-10m: (_guard "node")
     tr=(uv run torchrun --standalone --nproc-per-node=gpu)   # ranks from torchrun's env
     {
         step env 0 env_info
-        step data 0 uv run data.py --shards 1                # all GPUs idle
         step wire "$GPUS" "${tr[@]}" wire.py --out "$out"     # all GPUs busy
         train_all gpt2 20000000 "$GPUS" "${tr[@]}"           # all GPUs busy
         (export CUDA_VISIBLE_DEVICES=0; h100_kernels quick)  # 1 GPU busy, the rest idle
@@ -81,7 +79,7 @@ h100-node-10m: (_guard "node")
 # For several nodes, launch train.py and wire.py with torchrun or srun yourself: they
 # read RANK/WORLD_SIZE/LOCAL_RANK or SLURM_* from the environment.
 # H100 node, full: wire microbench, GPT-2 methods at 200M tokens on all GPUs, kernels
-h100-node: (_guard "node")
+h100-node: (_guard "node") (data "2")
     #!/usr/bin/env bash
     set -uo pipefail
     source run.sh
@@ -89,12 +87,15 @@ h100-node: (_guard "node")
     tr=(uv run torchrun --standalone --nproc-per-node=gpu)   # ranks from torchrun's env
     {
         step env 0 env_info
-        step data 0 uv run data.py --shards 2                # all GPUs idle
         step wire "$GPUS" "${tr[@]}" wire.py --out "$out"     # all GPUs busy
         train_all gpt2 200000000 "$GPUS" "${tr[@]}"          # all GPUs busy
         (export CUDA_VISIBLE_DEVICES=0; h100_kernels full)   # 1 GPU busy, the rest idle
     } 2>&1 | tee "$out/run.log"
     finish
+
+# Download FineWeb GPT-2 tokens (200 MB per shard) to ./data, or $LOCKSTEP_DATA
+data shards="1":
+    uv run data.py --shards {{shards}}
 
 # Fails unless the GPUs match the recipe
 _guard kind:

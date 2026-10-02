@@ -1,11 +1,13 @@
 """FineWeb as GPT-2 tokens (kjj0/fineweb10B-gpt2): download, then fixed-order batches.
 
-    uv run data.py --shards 1        # val + 1 train shard, 200 MB each, into data/fineweb10B
+    just data 1                      # val + 1 train shard, 200 MB each
 
-Shard format: 256 int32 header (magic 20240520, version 1, token count), then uint16 tokens.
+Shards live in $LOCKSTEP_DATA (default: ./data in the current directory).
+Format: 256 int32 header (magic 20240520, version 1, token count), then uint16 tokens.
 """
 
 import argparse
+import os
 import urllib.request
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import numpy as np
 import torch
 
 URL = "https://huggingface.co/datasets/kjj0/fineweb10B-gpt2/resolve/main/{}"
-DIR = Path(__file__).resolve().parent / "data" / "fineweb10B"
+DIR = Path(os.environ.get("LOCKSTEP_DATA", "data"))
 MAGIC, HEADER = 20240520, 256
 VAL = "fineweb_val_000000.bin"
 
@@ -53,7 +55,7 @@ class Batches:
     def __init__(self, split, batch, seq, rank=0, world=1, device="cuda"):
         names = [VAL] if split == "val" else sorted(p.name for p in DIR.glob("fineweb_train_*.bin"))
         if not names:
-            raise FileNotFoundError(f"no {split} shards in {DIR}; run `uv run data.py` first")
+            raise FileNotFoundError(f"no {split} shards in {DIR}; run `just data` first")
         self.shards = [load(DIR / n) for n in names]
         self.batch, self.seq, self.rank, self.world, self.device = batch, seq, rank, world, device
         self.reset()
